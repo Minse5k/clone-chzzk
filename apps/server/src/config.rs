@@ -11,7 +11,13 @@ pub struct Config {
     pub storage_dir: PathBuf,
     /// 브라우저 호출을 허용할 웹 출처. `*`이면 모두 허용한다.
     pub cors_allowed_origins: Vec<String>,
+    /// 녹화본 하나의 최대 크기.
+    pub max_upload_bytes: u64,
+    /// 저장된 녹화본 크기 합의 한도. OCI 무료 한도(20GB)를 넘지 않게 여유를 둔다.
+    pub storage_quota_bytes: u64,
 }
+
+const GIB: u64 = 1024 * 1024 * 1024;
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
@@ -23,7 +29,19 @@ impl Config {
                 .map(|origin| origin.trim().to_owned())
                 .filter(|origin| !origin.is_empty())
                 .collect(),
+            max_upload_bytes: env_bytes("MAX_UPLOAD_BYTES", 2 * GIB)?,
+            storage_quota_bytes: env_bytes("STORAGE_QUOTA_BYTES", 15 * GIB)?,
         })
+    }
+}
+
+fn env_bytes(key: &str, default: u64) -> anyhow::Result<u64> {
+    match env::var(key) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .with_context(|| format!("{key}는 바이트 단위 정수여야 합니다: {value}")),
+        Err(_) => Ok(default),
     }
 }
 

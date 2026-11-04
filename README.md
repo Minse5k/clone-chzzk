@@ -45,6 +45,8 @@ dx serve -p web
 | `SERVER_ADDR` | `0.0.0.0:3000` | 서버 바인딩 주소 |
 | `DATABASE_PATH` | `data/chzzk.db` | SQLite 파일 경로 |
 | `STORAGE_DIR` | `data/recordings` | local 저장소 디렉터리 |
+| `MAX_UPLOAD_BYTES` | `2147483648` (2GiB) | 녹화본 하나의 최대 크기. 넘으면 413 |
+| `STORAGE_QUOTA_BYTES` | `16106127360` (15GiB) | 저장된 녹화본 크기 합의 한도. 넘으면 507 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:8080` | 허용할 웹 출처(쉼표 구분, `*`는 전체) |
 | `API_BASE_URL` | `http://localhost:3000` | (웹 빌드 시) 웹이 호출할 서버 주소 |
 
@@ -56,8 +58,18 @@ dx serve -p web
 | `POST /api/broadcasts` | 방송 등록. `multipart/form-data`로 `title`(텍스트)과 `recording`(mp4/webm 파일)을 보낸다. 성공 시 201 |
 | `GET /api/broadcasts/{id}` | 방송 상세. 없으면 404 |
 | `GET /api/broadcasts/{id}/recording` | 녹화본 재생. `Range` 요청을 지원한다(206) |
+| `GET /api/upload-policy` | 녹화본 하나의 최대 크기와 남은 저장 공간 |
 
 오류 응답 본문은 `{ "message": "..." }` 형태의 한국어 메시지다.
+
+| 상태 | 방송 등록이 거부되는 경우 |
+|---|---|
+| 400 | 제목 누락·공백뿐·100자 초과(앞뒤 공백 제거 후), 녹화본 누락 |
+| 413 | 녹화본이 `MAX_UPLOAD_BYTES`보다 큼 |
+| 415 | mp4·webm이 아닌 파일 |
+| 507 | 등록하면 녹화본 크기 합이 `STORAGE_QUOTA_BYTES`를 넘음 |
+
+거부된 등록은 목록에 나타나지 않고 저장소에 파일을 남기지 않는다.
 
 ## 테스트
 

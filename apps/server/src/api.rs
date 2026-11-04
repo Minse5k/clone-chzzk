@@ -9,19 +9,20 @@ use axum::{
     routing::get,
 };
 use chrono::Utc;
-use futures_util::TryStreamExt;
+use futures_util::StreamExt;
 use serde_json::json;
-use shared::{Broadcast, Recording, registration_fields};
+use shared::{
+    Broadcast, Recording, TITLE_MAX_CHARS, UPLOAD_POLICY_PATH, UploadPolicy, format_bytes,
+    registration_fields,
+};
 use uuid::Uuid;
 
 use crate::{
     AppState,
-    db::{self, NewBroadcast, RecordingLocation},
+    db::{self, InsertError, NewBroadcast, RecordingLocation},
     range::{self, RangeRequest},
     storage::ByteRange,
 };
-
-const TITLE_MAX_CHARS: usize = 100;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -32,12 +33,26 @@ pub fn router() -> Router<AppState> {
                 // 녹화본은 스트리밍으로 저장하므로 axum 기본 본문 한도(2MB)를 쓰지 않는다.
                 .layer(DefaultBodyLimit::disable()),
         )
+        .route(UPLOAD_POLICY_PATH, get(upload_policy))
         .route("/api/broadcasts/{id}", get(get_broadcast))
         .route("/api/broadcasts/{id}/recording", get(play_recording))
 }
 
 async fn list_broadcasts(State(state): State<AppState>) -> Result<Json<Vec<Broadcast>>, ApiError> {
     Ok(Json(db::list_broadcasts(&state.db).await?))
+}
+
+/// 지금 등록할 수 있는 녹화본 크기. 웹이 업로드 전에 확인한다.
+async fn upload_policy(State(state): State<AppState>) -> Result<Json<UploadPolicy>, ApiError> {
+    Ok(Json(UploadPolicy {
+        max_upload_bytes: state.config.max_upload_bytes,
+        remaining_bytes: remaining_quota(&state).await?,
+    }))
+}
+
+async fn remaining_quota(state: &AppState) -> anyhow::Result<u64> {
+    let used = db::total_recording_bytes(&state.db).await?;
+    Ok(state.config.storage_quota_bytes.saturating_sub(used))
 }
 
 async fn get_broadcast(
@@ -73,7 +88,12 @@ async fn register_broadcast(
                 object_key: recording.object_key.clone(),
             },
         };
-        db::insert_broadcast(&state.db, &new).await?;
+        db::insert_broadcast(&state.db, &new, state.config.storage_quota_bytes)
+            .await
+            .map_err(|err| match err {
+                InsertError::QuotaExceeded => ApiError::quota_exceeded(),
+                InsertError::Other(err) => err.into(),
+            })?;
         Ok::<_, ApiError>(Broadcast {
             id: new.id,
             title: new.title,
@@ -111,7 +131,8 @@ async fn receive_registration(
     while let Some(field) = multipart.next_field().await.map_err(upload_interrupted)? {
         match field.name() {
             Some(registration_fields::TITLE) => {
-                title = Some(field.text().await.map_err(upload_interrupted)?);
+                // 제목이 녹화본보다 먼저 오면 큰 파일을 받기 전에 거부할 수 있다.
+                title = Some(validate_title(&field.text().await.map_err(upload_interrupted)?)?);
             }
             Some(registration_fields::RECORDING) => {
                 if saved.is_some() {
@@ -122,13 +143,25 @@ async fn receive_registration(
                         StatusCode::UNSUPPORTED_MEDIA_TYPE,
                         "mp4 또는 webm 영상만 등록할 수 있습니다.",
                     ))?;
+                let limit = UploadLimit::for_new_recording(state).await?;
                 let object_key = format!("{id}.{}", video.extension());
-                let stream = field.map_err(io::Error::other);
+
+                let mut received = 0u64;
+                let stream = field.map(move |chunk| {
+                    let chunk = chunk.map_err(io::Error::other)?;
+                    received += chunk.len() as u64;
+                    if received > limit.bytes {
+                        return Err(io::Error::other(LimitExceeded));
+                    }
+                    Ok(chunk)
+                });
                 let size_bytes = state.store.put(&object_key, stream).await.map_err(|err| {
-                    if err.get_ref().is_some_and(|inner| inner.is::<MultipartError>()) {
-                        ApiError::bad_request("업로드가 중간에 끊겼습니다. 다시 시도해 주세요.")
-                    } else {
-                        anyhow::Error::from(err).context("녹화본 저장 실패").into()
+                    match err.get_ref() {
+                        Some(inner) if inner.is::<LimitExceeded>() => limit.exceeded_error(),
+                        Some(inner) if inner.is::<MultipartError>() => {
+                            ApiError::bad_request("업로드가 중간에 끊겼습니다. 다시 시도해 주세요.")
+                        }
+                        _ => anyhow::Error::from(err).context("녹화본 저장 실패").into(),
                     }
                 })?;
                 *saved = Some(SavedRecording { object_key, content_type: video.content_type(), size_bytes });
@@ -136,11 +169,58 @@ async fn receive_registration(
             _ => {}
         }
     }
-    validate_title(title)
+    title.ok_or_else(|| ApiError::bad_request("제목을 입력해 주세요."))
 }
 
-fn validate_title(title: Option<String>) -> Result<String, ApiError> {
-    let title = title.as_deref().map(str::trim).unwrap_or_default();
+/// 업로드 중인 녹화본이 넘으면 안 되는 크기.
+#[derive(Clone, Copy)]
+struct UploadLimit {
+    bytes: u64,
+    /// 개별 상한보다 저장 총량의 남은 크기가 더 작아서 한도가 정해졌는지.
+    by_quota: bool,
+    max_upload_bytes: u64,
+}
+
+impl UploadLimit {
+    async fn for_new_recording(state: &AppState) -> Result<Self, ApiError> {
+        let max_upload_bytes = state.config.max_upload_bytes;
+        let remaining = remaining_quota(state).await?;
+        if remaining == 0 {
+            return Err(ApiError::quota_exceeded());
+        }
+        Ok(Self {
+            bytes: max_upload_bytes.min(remaining),
+            by_quota: remaining < max_upload_bytes,
+            max_upload_bytes,
+        })
+    }
+
+    fn exceeded_error(self) -> ApiError {
+        if self.by_quota {
+            ApiError::quota_exceeded()
+        } else {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("녹화본은 {} 이하만 등록할 수 있습니다.", format_bytes(self.max_upload_bytes)),
+            )
+        }
+    }
+}
+
+/// 업로드 스트림이 한도를 넘었다는 표시. 저장소가 쓰다 만 객체를 정리하게 만든다.
+#[derive(Debug)]
+struct LimitExceeded;
+
+impl std::fmt::Display for LimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("업로드 한도 초과")
+    }
+}
+
+impl std::error::Error for LimitExceeded {}
+
+fn validate_title(title: &str) -> Result<String, ApiError> {
+    let title = title.trim();
     if title.is_empty() {
         return Err(ApiError::bad_request("제목을 입력해 주세요."));
     }
@@ -267,6 +347,13 @@ impl ApiError {
 
     fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, message)
+    }
+
+    fn quota_exceeded() -> Self {
+        Self::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "저장 공간 한도에 도달해 더 이상 방송을 등록할 수 없습니다.",
+        )
     }
 }
 

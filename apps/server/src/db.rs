@@ -118,9 +118,42 @@ pub async fn find_broadcast(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Optio
         .transpose()
 }
 
+/// 저장된 녹화본 크기의 합.
+pub async fn total_recording_bytes(pool: &SqlitePool) -> anyhow::Result<u64> {
+    let total: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes), 0) FROM recordings")
+        .fetch_one(pool)
+        .await?;
+    Ok(total.try_into()?)
+}
+
+#[derive(Debug)]
+pub enum InsertError {
+    /// 기록하면 녹화본 크기 합이 저장 총량 한도를 넘는다.
+    QuotaExceeded,
+    Other(anyhow::Error),
+}
+
+impl<E: Into<anyhow::Error>> From<E> for InsertError {
+    fn from(err: E) -> Self {
+        Self::Other(err.into())
+    }
+}
+
 /// 방송과 녹화본을 한 트랜잭션으로 기록한다.
-pub async fn insert_broadcast(pool: &SqlitePool, new: &NewBroadcast) -> anyhow::Result<()> {
-    let mut tx = pool.begin().await?;
+/// 동시에 들어온 등록끼리도 저장 총량 한도를 넘지 않도록 같은 트랜잭션 안에서 합을 다시 확인한다.
+pub async fn insert_broadcast(
+    pool: &SqlitePool,
+    new: &NewBroadcast,
+    storage_quota_bytes: u64,
+) -> Result<(), InsertError> {
+    // BEGIN IMMEDIATE로 쓰기 잠금을 먼저 잡아, 합 확인과 기록 사이에 다른 등록이 끼지 못하게 한다.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let total: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes), 0) FROM recordings")
+        .fetch_one(&mut *tx)
+        .await?;
+    if u64::try_from(total)?.saturating_add(new.recording.size_bytes) > storage_quota_bytes {
+        return Err(InsertError::QuotaExceeded);
+    }
     sqlx::query("INSERT INTO broadcasts (id, title, created_at) VALUES (?, ?, ?)")
         .bind(new.id.to_string())
         .bind(&new.title)

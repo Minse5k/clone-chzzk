@@ -2,7 +2,9 @@
 
 use gloo_net::http::{Request, Response};
 use serde::{Deserialize, de::DeserializeOwned};
-use shared::{Broadcast, broadcast_path, recording_path, registration_fields};
+use shared::{
+    Broadcast, UPLOAD_POLICY_PATH, UploadPolicy, broadcast_path, recording_path, registration_fields,
+};
 use uuid::Uuid;
 use web_sys::{File, FormData};
 
@@ -29,6 +31,10 @@ pub async fn get_broadcast(id: &str) -> ApiResult<Broadcast> {
     read_json(Request::get(&url(&broadcast_path(id))).send().await).await
 }
 
+pub async fn get_upload_policy() -> ApiResult<UploadPolicy> {
+    read_json(Request::get(&url(UPLOAD_POLICY_PATH)).send().await).await
+}
+
 /// 녹화본 재생 주소. `<video src>`에 그대로 쓴다.
 pub fn recording_url(id: Uuid) -> String {
     url(&recording_path(id))
@@ -43,7 +49,11 @@ pub async fn register_broadcast(title: &str, recording: &File) -> ApiResult<Broa
     let request = Request::post(&url("/api/broadcasts"))
         .body(form)
         .map_err(|_| "업로드를 준비할 수 없습니다.".to_owned())?;
-    read_json(request.send().await).await
+    let response = request.send().await.map_err(|_| {
+        // 서버가 한도 초과 등으로 업로드 도중 연결을 끊으면 응답 대신 네트워크 오류가 된다.
+        "업로드에 실패했습니다. 파일 크기와 네트워크 상태를 확인하고 다시 시도해 주세요.".to_owned()
+    })?;
+    read_json(Ok(response)).await
 }
 
 #[derive(Deserialize)]

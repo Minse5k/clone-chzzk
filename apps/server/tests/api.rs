@@ -7,14 +7,28 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::Value;
-use shared::{Broadcast, recording_path};
+use shared::{Broadcast, UPLOAD_POLICY_PATH, UploadPolicy, recording_path};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
 /// 테스트마다 임시 SQLite 파일과 임시 local 저장소를 쓰는 서버.
 struct TestServer {
     dir: TempDir,
+    limits: Limits,
     app: Router,
+}
+
+/// 테스트 서버의 업로드 한도.
+#[derive(Clone, Copy)]
+struct Limits {
+    max_upload_bytes: u64,
+    storage_quota_bytes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { max_upload_bytes: 1024 * 1024, storage_quota_bytes: 10 * 1024 * 1024 }
+    }
 }
 
 struct TestResponse {
@@ -47,24 +61,30 @@ const BOUNDARY: &str = "test-boundary-7f3a";
 
 impl TestServer {
     async fn start() -> Self {
+        Self::with_limits(Limits::default()).await
+    }
+
+    async fn with_limits(limits: Limits) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let app = server::build_app(Self::config(&dir)).await.unwrap();
-        Self { dir, app }
+        let app = server::build_app(Self::config(&dir, limits)).await.unwrap();
+        Self { dir, limits, app }
     }
 
     /// 같은 DB 파일과 저장소로 서버를 다시 띄운다.
     async fn restart(self) -> Self {
-        let Self { dir, app } = self;
+        let Self { dir, limits, app } = self;
         drop(app);
-        let app = server::build_app(Self::config(&dir)).await.unwrap();
-        Self { dir, app }
+        let app = server::build_app(Self::config(&dir, limits)).await.unwrap();
+        Self { dir, limits, app }
     }
 
-    fn config(dir: &TempDir) -> server::Config {
+    fn config(dir: &TempDir, limits: Limits) -> server::Config {
         server::Config {
             database_path: dir.path().join("test.db"),
             storage_dir: dir.path().join("recordings"),
             cors_allowed_origins: vec!["http://localhost:8080".into()],
+            max_upload_bytes: limits.max_upload_bytes,
+            storage_quota_bytes: limits.storage_quota_bytes,
         }
     }
 
@@ -133,6 +153,20 @@ impl TestServer {
         let response = self.get("/api/broadcasts").await;
         assert_eq!(response.status, StatusCode::OK);
         response.json()
+    }
+
+    /// 거부되어야 하는 등록을 보내고, 상태 코드와 메시지를 확인한 뒤
+    /// 목록과 저장소에 아무것도 남지 않았는지 확인한다.
+    async fn assert_rejected(&self, parts: &[Part<'_>], status: StatusCode, message: &str) {
+        let before_list = self.list_broadcasts().await;
+        let before_files = self.stored_file_count();
+
+        let response = self.post_registration(parts).await;
+
+        assert_eq!(response.status, status, "{}", String::from_utf8_lossy(&response.body));
+        assert_eq!(response.error_message(), message);
+        assert_eq!(self.list_broadcasts().await, before_list);
+        assert_eq!(self.stored_file_count(), before_files);
     }
 
     /// local 저장소에 남아 있는 파일 수.
@@ -270,4 +304,114 @@ async fn 서버를_다시_시작해도_방송과_녹화본이_남아_있다() {
     let recording = server.get(&recording_path(created.id)).await;
     assert_eq!(recording.body, video);
     assert_eq!(server.stored_file_count(), 1);
+}
+
+fn mp4(bytes: &[u8]) -> Part<'_> {
+    Part::File { name: "recording", file_name: "clip.mp4", content_type: "video/mp4", bytes }
+}
+
+#[tokio::test]
+async fn 제목이_없거나_공백이거나_너무_길면_400이다() {
+    let server = TestServer::start().await;
+    let video = sample_video(100);
+    let too_long = "가".repeat(101);
+
+    server.assert_rejected(&[mp4(&video)], StatusCode::BAD_REQUEST, "제목을 입력해 주세요.").await;
+    server
+        .assert_rejected(&[Part::Text("title", "   "), mp4(&video)], StatusCode::BAD_REQUEST, "제목을 입력해 주세요.")
+        .await;
+    server
+        .assert_rejected(
+            &[Part::Text("title", &too_long), mp4(&video)],
+            StatusCode::BAD_REQUEST,
+            "제목은 100자 이하로 입력해 주세요.",
+        )
+        .await;
+    // 녹화본이 제목보다 먼저 와서 이미 저장된 경우에도 정리된다.
+    server
+        .assert_rejected(&[mp4(&video), Part::Text("title", " ")], StatusCode::BAD_REQUEST, "제목을 입력해 주세요.")
+        .await;
+}
+
+#[tokio::test]
+async fn 제목은_앞뒤_공백을_빼고_100자까지_등록된다() {
+    let server = TestServer::start().await;
+    let title = "가".repeat(100);
+
+    let created = server.register(&format!("  {title}  "), &sample_video(10)).await;
+
+    assert_eq!(created.title, title);
+}
+
+#[tokio::test]
+async fn 녹화본이_없으면_400이다() {
+    let server = TestServer::start().await;
+
+    server
+        .assert_rejected(&[Part::Text("title", "녹화본 없음")], StatusCode::BAD_REQUEST, "녹화본 파일을 선택해 주세요.")
+        .await;
+}
+
+#[tokio::test]
+async fn mp4나_webm이_아니면_415다() {
+    let server = TestServer::start().await;
+
+    for (file_name, content_type) in [("clip.mov", "video/quicktime"), ("notes.txt", "text/plain"), ("clip", "video/x-msvideo")] {
+        server
+            .assert_rejected(
+                &[
+                    Part::Text("title", "형식 테스트"),
+                    Part::File { name: "recording", file_name, content_type, bytes: b"data" },
+                ],
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "mp4 또는 webm 영상만 등록할 수 있습니다.",
+            )
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn 녹화본이_개별_상한을_넘으면_413이고_상한과_같으면_등록된다() {
+    let server = TestServer::with_limits(Limits { max_upload_bytes: 2048, storage_quota_bytes: 1024 * 1024 }).await;
+
+    server
+        .assert_rejected(
+            &[Part::Text("title", "너무 큼"), mp4(&sample_video(2049))],
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "녹화본은 2KB 이하만 등록할 수 있습니다.",
+        )
+        .await;
+
+    let created = server.register("딱 맞음", &sample_video(2048)).await;
+    assert_eq!(created.recording.unwrap().size_bytes, 2048);
+}
+
+#[tokio::test]
+async fn 저장_총량_한도를_넘으면_507이다() {
+    let server = TestServer::with_limits(Limits { max_upload_bytes: 1000, storage_quota_bytes: 1500 }).await;
+    let message = "저장 공간 한도에 도달해 더 이상 방송을 등록할 수 없습니다.";
+
+    server.register("첫 방송", &sample_video(1000)).await;
+    // 남은 500바이트보다 크다. 개별 상한(1000)보다는 작아도 저장 총량 때문에 거부된다.
+    server
+        .assert_rejected(&[Part::Text("title", "두 번째"), mp4(&sample_video(600))], StatusCode::INSUFFICIENT_STORAGE, message)
+        .await;
+
+    server.register("남은 만큼", &sample_video(500)).await;
+    server
+        .assert_rejected(&[Part::Text("title", "꽉 참"), mp4(&sample_video(1))], StatusCode::INSUFFICIENT_STORAGE, message)
+        .await;
+}
+
+#[tokio::test]
+async fn 업로드_한도는_남은_저장_공간을_반영한다() {
+    let server = TestServer::with_limits(Limits { max_upload_bytes: 1000, storage_quota_bytes: 1500 }).await;
+
+    let before: UploadPolicy = server.get(UPLOAD_POLICY_PATH).await.json();
+    assert_eq!(before, UploadPolicy { max_upload_bytes: 1000, remaining_bytes: 1500 });
+
+    server.register("방송", &sample_video(400)).await;
+
+    let after: UploadPolicy = server.get(UPLOAD_POLICY_PATH).await.json();
+    assert_eq!(after, UploadPolicy { max_upload_bytes: 1000, remaining_bytes: 1100 });
 }

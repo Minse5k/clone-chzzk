@@ -111,3 +111,5 @@ button:disabled { opacity: 0.6; cursor: progress; }
 }
 
 .registration-form button { margin-top: 16px; align-self: flex-start; }
+
+.hint { color: var(--muted); font-size: 13px; margin: 4px 0 0; }

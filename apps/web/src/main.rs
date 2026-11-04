@@ -4,6 +4,7 @@ mod api;
 
 use chrono::{DateTime, Local, Utc};
 use dioxus::prelude::*;
+use shared::{TITLE_MAX_CHARS, UploadPolicy, format_bytes};
 use wasm_bindgen::JsCast;
 use web_sys::HtmlInputElement;
 
@@ -109,6 +110,7 @@ fn BroadcastRegistration() -> Element {
     let mut title = use_signal(String::new);
     let mut submitting = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
+    let mut policy = use_resource(api::get_upload_policy);
     let navigator = use_navigator();
 
     let submit = move |event: FormEvent| async move {
@@ -116,17 +118,25 @@ fn BroadcastRegistration() -> Element {
         if submitting() {
             return;
         }
-        let Some(file) = selected_recording() else {
-            error.set(Some("녹화본 파일을 선택해 주세요.".into()));
+        let file = selected_recording();
+        // 서버도 같은 검사를 하지만, 큰 파일을 다 올린 뒤에 거부되지 않도록 먼저 확인한다.
+        let current_policy = policy.read().as_ref().and_then(|p| p.as_ref().ok()).cloned();
+        if let Err(message) = check_registration(&title(), file.as_ref(), current_policy.as_ref()) {
+            error.set(Some(message));
             return;
-        };
+        }
+        let Some(file) = file else { return };
         submitting.set(true);
         error.set(None);
         match api::register_broadcast(&title(), &file).await {
             Ok(broadcast) => {
                 navigator.push(Route::BroadcastDetail { id: broadcast.id.to_string() });
             }
-            Err(message) => error.set(Some(message)),
+            Err(message) => {
+                error.set(Some(message));
+                // 다른 등록으로 남은 저장 공간이 바뀌었을 수 있다.
+                policy.restart();
+            }
         }
         submitting.set(false);
     };
@@ -138,9 +148,10 @@ fn BroadcastRegistration() -> Element {
             input {
                 id: "title",
                 r#type: "text",
-                maxlength: 100,
+                maxlength: TITLE_MAX_CHARS as i64,
                 placeholder: "방송 제목",
                 value: "{title}",
+                disabled: submitting(),
                 oninput: move |event| title.set(event.value()),
             }
             label { r#for: RECORDING_INPUT_ID, "녹화본 (mp4, webm)" }
@@ -148,15 +159,49 @@ fn BroadcastRegistration() -> Element {
                 id: RECORDING_INPUT_ID,
                 r#type: "file",
                 accept: "video/mp4,video/webm,.mp4,.webm",
+                disabled: submitting(),
+            }
+            if let Some(Ok(policy)) = &*policy.read() {
+                p { class: "hint",
+                    "파일 하나당 최대 {format_bytes(policy.max_upload_bytes)} · 남은 저장 공간 {format_bytes(policy.remaining_bytes)}"
+                }
             }
             if let Some(message) = error() {
-                p { class: "notice error", "{message}" }
+                p { class: "notice error", role: "alert", "{message}" }
             }
             button { r#type: "submit", disabled: submitting(),
                 if submitting() { "업로드 중…" } else { "등록" }
             }
         }
     }
+}
+
+/// 서버에 보내기 전에 걸러낼 수 있는 등록 오류. 문구는 서버와 같다.
+fn check_registration(
+    title: &str,
+    file: Option<&web_sys::File>,
+    policy: Option<&UploadPolicy>,
+) -> Result<(), String> {
+    if title.trim().is_empty() {
+        return Err("제목을 입력해 주세요.".into());
+    }
+    let Some(file) = file else {
+        return Err("녹화본 파일을 선택해 주세요.".into());
+    };
+    let name = file.name().to_ascii_lowercase();
+    if !(name.ends_with(".mp4") || name.ends_with(".webm")) {
+        return Err("mp4 또는 webm 영상만 등록할 수 있습니다.".into());
+    }
+    if let Some(policy) = policy {
+        let size = file.size() as u64;
+        if size > policy.max_upload_bytes {
+            return Err(format!("녹화본은 {} 이하만 등록할 수 있습니다.", format_bytes(policy.max_upload_bytes)));
+        }
+        if size > policy.remaining_bytes {
+            return Err("저장 공간 한도에 도달해 더 이상 방송을 등록할 수 없습니다.".into());
+        }
+    }
+    Ok(())
 }
 
 /// 파일 입력에서 고른 녹화본. 내용을 읽지 않고 브라우저의 `File` 핸들만 가져온다.
