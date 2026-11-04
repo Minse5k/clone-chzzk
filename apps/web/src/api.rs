@@ -26,9 +26,19 @@ pub async fn list_broadcasts() -> ApiResult<Vec<Broadcast>> {
     read_json(Request::get(&url("/api/broadcasts")).send().await).await
 }
 
-pub async fn get_broadcast(id: &str) -> ApiResult<Broadcast> {
-    let id = Uuid::parse_str(id).map_err(|_| "방송을 찾을 수 없습니다.".to_owned())?;
-    read_json(Request::get(&url(&broadcast_path(id))).send().await).await
+/// 방송 하나. 없는 방송(형식이 틀린 ID 포함)이면 `None`.
+pub async fn get_broadcast(id: &str) -> ApiResult<Option<Broadcast>> {
+    let Ok(id) = Uuid::parse_str(id) else {
+        return Ok(None);
+    };
+    let response = Request::get(&url(&broadcast_path(id)))
+        .send()
+        .await
+        .map_err(|_| "서버에 연결할 수 없습니다.".to_owned())?;
+    if response.status() == 404 {
+        return Ok(None);
+    }
+    read_json(Ok(response)).await.map(Some)
 }
 
 pub async fn get_upload_policy() -> ApiResult<UploadPolicy> {

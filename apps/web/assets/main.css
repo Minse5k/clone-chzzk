@@ -113,3 +113,24 @@ button:disabled { opacity: 0.6; cursor: progress; }
 .registration-form button { margin-top: 16px; align-self: flex-start; }
 
 .hint { color: var(--muted); font-size: 13px; margin: 4px 0 0; }
+
+.back { display: inline-block; color: var(--muted); margin-bottom: 12px; }
+.back:hover { color: var(--text); }
+
+.share { margin-top: 24px; display: flex; flex-direction: column; gap: 6px; max-width: 640px; }
+.share label { font-weight: 700; }
+.share-row { display: flex; gap: 8px; }
+.share-row input {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: 14px;
+}
+
+.not-found { text-align: center; padding: 48px 0; }
+.not-found .notice { margin-bottom: 24px; }

@@ -21,6 +21,8 @@ enum Route {
     BroadcastRegistration {},
     #[route("/broadcasts/:id")]
     BroadcastDetail { id: String },
+    #[route("/:..segments")]
+    PageNotFound { segments: Vec<String> },
 }
 
 fn main() {
@@ -84,8 +86,12 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
     match &*broadcast.read() {
         None => rsx! { p { class: "notice", "불러오는 중…" } },
         Some(Err(message)) => rsx! { p { class: "notice error", "{message}" } },
-        Some(Ok(broadcast)) => rsx! {
+        Some(Ok(None)) => rsx! {
+            NotFound { message: "방송을 찾을 수 없습니다. 공유 URL이 올바른지 확인해 주세요." }
+        },
+        Some(Ok(Some(broadcast))) => rsx! {
             article { class: "broadcast-detail",
+                Link { class: "back", to: Route::BroadcastList {}, "← 목록으로" }
                 if broadcast.recording.is_some() {
                     video {
                         class: "player",
@@ -98,8 +104,106 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
                 }
                 h1 { "{broadcast.title}" }
                 p { class: "meta", "등록 " {format_time(broadcast.created_at)} }
+                ShareUrl { id: broadcast.id.to_string() }
             }
         },
+    }
+}
+
+/// 공유 URL과 복사 버튼. 이 주소를 받은 누구나 로그인 없이 방송을 볼 수 있다.
+#[component]
+fn ShareUrl(id: String) -> Element {
+    let share_url = share_url(&id);
+    let mut copied = use_signal(|| None::<bool>);
+    let copy = {
+        let share_url = share_url.clone();
+        move |_| {
+            let share_url = share_url.clone();
+            async move { copied.set(Some(copy_to_clipboard(&share_url).await)) }
+        }
+    };
+
+    rsx! {
+        section { class: "share",
+            label { r#for: "share-url", "공유 URL" }
+            div { class: "share-row",
+                input {
+                    id: "share-url",
+                    r#type: "text",
+                    readonly: true,
+                    value: "{share_url}",
+                    onfocus: move |_| select_share_url(),
+                }
+                button { r#type: "button", onclick: copy, "복사" }
+            }
+            match copied() {
+                Some(true) => rsx! { p { class: "hint", role: "status", "공유 URL을 복사했습니다." } },
+                Some(false) => rsx! {
+                    p { class: "notice error", role: "status", "자동 복사가 막혀 있습니다. 주소를 직접 복사해 주세요." }
+                },
+                None => rsx! {},
+            }
+        }
+    }
+}
+
+/// 지금 열린 웹 주소를 기준으로 만든 방송 상세 화면의 절대 주소.
+fn share_url(id: &str) -> String {
+    let origin = web_sys::window()
+        .and_then(|window| window.location().origin().ok())
+        .unwrap_or_default();
+    format!("{origin}{}", Route::BroadcastDetail { id: id.to_owned() })
+}
+
+/// 클립보드에 복사한다. HTTP로 배포된 주소처럼 클립보드 API를 쓸 수 없는
+/// 보안되지 않은 출처에서는 선택 후 복사 명령으로 대신한다.
+async fn copy_to_clipboard(text: &str) -> bool {
+    let script = r#"
+        const text = await dioxus.recv();
+        if (window.isSecureContext && navigator.clipboard) {
+            try { await navigator.clipboard.writeText(text); return true; } catch (_) {}
+        }
+        const area = document.createElement("textarea");
+        area.value = text;
+        area.style.position = "fixed";
+        area.style.opacity = "0";
+        document.body.appendChild(area);
+        area.select();
+        let ok = false;
+        try { ok = document.execCommand("copy"); } catch (_) {}
+        area.remove();
+        return ok;
+    "#;
+    let eval = document::eval(script);
+    if eval.send(text).is_err() {
+        return false;
+    }
+    eval.join::<bool>().await.unwrap_or(false)
+}
+
+fn select_share_url() {
+    if let Some(input) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("share-url"))
+        .and_then(|element| element.dyn_into::<HtmlInputElement>().ok())
+    {
+        input.select();
+    }
+}
+
+#[component]
+fn PageNotFound(segments: Vec<String>) -> Element {
+    rsx! { NotFound { message: "요청한 페이지가 없습니다." } }
+}
+
+#[component]
+fn NotFound(message: String) -> Element {
+    rsx! {
+        section { class: "not-found",
+            h1 { "찾을 수 없음" }
+            p { class: "notice", "{message}" }
+            Link { class: "button", to: Route::BroadcastList {}, "방송 목록으로" }
+        }
     }
 }
 
