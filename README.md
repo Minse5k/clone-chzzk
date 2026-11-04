@@ -48,6 +48,17 @@ dx serve -p web
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:8080` | 허용할 웹 출처(쉼표 구분, `*`는 전체) |
 | `API_BASE_URL` | `http://localhost:3000` | (웹 빌드 시) 웹이 호출할 서버 주소 |
 
+## API
+
+| 메서드·경로 | 설명 |
+|---|---|
+| `GET /api/broadcasts` | 방송 목록(최신 등록순) |
+| `POST /api/broadcasts` | 방송 등록. `multipart/form-data`로 `title`(텍스트)과 `recording`(mp4/webm 파일)을 보낸다. 성공 시 201 |
+| `GET /api/broadcasts/{id}` | 방송 상세. 없으면 404 |
+| `GET /api/broadcasts/{id}/recording` | 녹화본 재생. `Range` 요청을 지원한다(206) |
+
+오류 응답 본문은 `{ "message": "..." }` 형태의 한국어 메시지다.
+
 ## 테스트
 
 ```bash

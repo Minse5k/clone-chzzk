@@ -2847,6 +2847,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "futures-util",
  "http-body-util",
  "serde",
  "serde_json",
@@ -2854,6 +2855,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tower",
  "tower-http 0.7.1",
  "tracing",
@@ -3900,6 +3902,9 @@ dependencies = [
  "gloo-net",
  "serde",
  "shared",
+ "uuid",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

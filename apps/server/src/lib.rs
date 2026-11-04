@@ -3,12 +3,15 @@
 mod api;
 mod config;
 mod db;
+mod range;
+mod storage;
 
 use std::sync::Arc;
 
 use anyhow::Context;
 use axum::{Router, http::HeaderValue};
 use sqlx::SqlitePool;
+use storage::{LocalStore, RecordingStore};
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
     trace::TraceLayer,
@@ -19,18 +22,17 @@ pub use config::{Config, server_addr_from_env};
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqlitePool,
+    pub store: Arc<RecordingStore>,
     pub config: Arc<Config>,
 }
 
 /// 설정으로 DB와 저장소를 준비하고 HTTP 라우터를 만든다.
 /// 같은 설정으로 다시 부르면 기존 데이터를 그대로 이어서 쓴다.
 pub async fn build_app(config: Config) -> anyhow::Result<Router> {
-    tokio::fs::create_dir_all(&config.storage_dir)
-        .await
-        .with_context(|| format!("저장 디렉터리를 만들 수 없습니다: {}", config.storage_dir.display()))?;
+    let store = RecordingStore::Local(LocalStore::open(&config.storage_dir).await?);
     let db = db::connect(&config.database_path).await?;
     let cors = cors_layer(&config.cors_allowed_origins)?;
-    let state = AppState { db, config: Arc::new(config) };
+    let state = AppState { db, store: Arc::new(store), config: Arc::new(config) };
 
     Ok(api::router()
         .with_state(state)
