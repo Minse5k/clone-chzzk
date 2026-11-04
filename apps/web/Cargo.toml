@@ -1,0 +1,12 @@
+[package]
+name = "web"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+shared.workspace = true
+serde.workspace = true
+chrono = { workspace = true, features = ["wasmbind"] }
+dioxus = { version = "0.7", features = ["web", "router"] }
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
