@@ -3,7 +3,8 @@
 use gloo_net::http::{Request, Response};
 use serde::{Deserialize, de::DeserializeOwned};
 use shared::{
-    Broadcast, UPLOAD_POLICY_PATH, UploadPolicy, broadcast_path, recording_path, registration_fields,
+    Broadcast, UPLOAD_POLICY_PATH, UploadPolicy, broadcast_path, recording_path,
+    registration_fields,
 };
 use uuid::Uuid;
 use web_sys::{File, FormData};
@@ -54,7 +55,13 @@ pub fn recording_url(id: Uuid) -> String {
 pub async fn register_broadcast(title: &str, recording: &File) -> ApiResult<Broadcast> {
     let form = FormData::new().map_err(|_| "업로드를 준비할 수 없습니다.".to_owned())?;
     form.append_with_str(registration_fields::TITLE, title)
-        .and_then(|()| form.append_with_blob_and_filename(registration_fields::RECORDING, recording, &recording.name()))
+        .and_then(|()| {
+            form.append_with_blob_and_filename(
+                registration_fields::RECORDING,
+                recording,
+                &recording.name(),
+            )
+        })
         .map_err(|_| "업로드를 준비할 수 없습니다.".to_owned())?;
     let request = Request::post(&url("/api/broadcasts"))
         .body(form)
@@ -71,7 +78,9 @@ struct ErrorBody {
     message: String,
 }
 
-async fn read_json<T: DeserializeOwned>(response: Result<Response, gloo_net::Error>) -> ApiResult<T> {
+async fn read_json<T: DeserializeOwned>(
+    response: Result<Response, gloo_net::Error>,
+) -> ApiResult<T> {
     let response = response.map_err(|_| "서버에 연결할 수 없습니다.".to_owned())?;
     if !response.ok() {
         return Err(match response.json::<ErrorBody>().await {

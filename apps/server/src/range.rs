@@ -46,5 +46,8 @@ pub fn parse(header: Option<&str>, size: u64) -> RangeRequest {
     if first >= size || first > last {
         return RangeRequest::Unsatisfiable;
     }
-    RangeRequest::Partial(ByteRange { start: first, len: last - first + 1 })
+    RangeRequest::Partial(ByteRange {
+        start: first,
+        len: last - first + 1,
+    })
 }

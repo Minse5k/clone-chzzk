@@ -75,8 +75,14 @@ impl TryFrom<BroadcastRow> for StoredBroadcast {
             row.size_bytes,
         ) {
             (Some(storage_backend), Some(object_key), Some(content_type), Some(size_bytes)) => (
-                Some(Recording { content_type, size_bytes: size_bytes.try_into()? }),
-                Some(RecordingLocation { storage_backend, object_key }),
+                Some(Recording {
+                    content_type,
+                    size_bytes: size_bytes.try_into()?,
+                }),
+                Some(RecordingLocation {
+                    storage_backend,
+                    object_key,
+                }),
             ),
             _ => (None, None),
         };
@@ -99,9 +105,9 @@ const SELECT_BROADCASTS: &str = "\
 
 /// 방송 목록, 최신 등록순.
 pub async fn list_broadcasts(pool: &SqlitePool) -> anyhow::Result<Vec<Broadcast>> {
-    sqlx::query_as::<_, BroadcastRow>(
-        sqlx::AssertSqlSafe(format!("{SELECT_BROADCASTS} ORDER BY b.created_at DESC, b.id DESC")),
-    )
+    sqlx::query_as::<_, BroadcastRow>(sqlx::AssertSqlSafe(format!(
+        "{SELECT_BROADCASTS} ORDER BY b.created_at DESC, b.id DESC"
+    )))
     .fetch_all(pool)
     .await?
     .into_iter()
@@ -109,13 +115,18 @@ pub async fn list_broadcasts(pool: &SqlitePool) -> anyhow::Result<Vec<Broadcast>
     .collect()
 }
 
-pub async fn find_broadcast(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<StoredBroadcast>> {
-    sqlx::query_as::<_, BroadcastRow>(sqlx::AssertSqlSafe(format!("{SELECT_BROADCASTS} WHERE b.id = ?")))
-        .bind(id.to_string())
-        .fetch_optional(pool)
-        .await?
-        .map(StoredBroadcast::try_from)
-        .transpose()
+pub async fn find_broadcast(
+    pool: &SqlitePool,
+    id: Uuid,
+) -> anyhow::Result<Option<StoredBroadcast>> {
+    sqlx::query_as::<_, BroadcastRow>(sqlx::AssertSqlSafe(format!(
+        "{SELECT_BROADCASTS} WHERE b.id = ?"
+    )))
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await?
+    .map(StoredBroadcast::try_from)
+    .transpose()
 }
 
 /// 저장된 녹화본 크기의 합.

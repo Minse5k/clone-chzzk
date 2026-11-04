@@ -57,7 +57,9 @@ impl std::fmt::Debug for OciStorageConfig {
 impl StorageConfig {
     fn from_env() -> anyhow::Result<Self> {
         match env_or("STORAGE_BACKEND", "local").trim() {
-            "local" => Ok(Self::Local { dir: env_or("STORAGE_DIR", "data/recordings").into() }),
+            "local" => Ok(Self::Local {
+                dir: env_or("STORAGE_DIR", "data/recordings").into(),
+            }),
             "oci" => {
                 let mut missing = Vec::new();
                 let mut required = |key: &'static str| {

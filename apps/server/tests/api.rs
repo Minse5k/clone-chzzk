@@ -27,7 +27,10 @@ struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_upload_bytes: 1024 * 1024, storage_quota_bytes: 10 * 1024 * 1024 }
+        Self {
+            max_upload_bytes: 1024 * 1024,
+            storage_quota_bytes: 10 * 1024 * 1024,
+        }
     }
 }
 
@@ -54,7 +57,12 @@ impl TestResponse {
 /// 방송 등록 요청의 multipart 본문 조각.
 enum Part<'a> {
     Text(&'a str, &'a str),
-    File { name: &'a str, file_name: &'a str, content_type: &'a str, bytes: &'a [u8] },
+    File {
+        name: &'a str,
+        file_name: &'a str,
+        content_type: &'a str,
+        bytes: &'a [u8],
+    },
 }
 
 const BOUNDARY: &str = "test-boundary-7f3a";
@@ -81,7 +89,9 @@ impl TestServer {
     fn config(dir: &TempDir, limits: Limits) -> server::Config {
         server::Config {
             database_path: dir.path().join("test.db"),
-            storage: server::StorageConfig::Local { dir: dir.path().join("recordings") },
+            storage: server::StorageConfig::Local {
+                dir: dir.path().join("recordings"),
+            },
             cors_allowed_origins: vec!["http://localhost:8080".into()],
             max_upload_bytes: limits.max_upload_bytes,
             storage_quota_bytes: limits.storage_quota_bytes,
@@ -93,16 +103,30 @@ impl TestServer {
         let response = self.app.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let headers = response.headers().clone();
-        let body = response.into_body().collect().await.unwrap().to_bytes().to_vec();
-        TestResponse { status, headers, body }
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        TestResponse {
+            status,
+            headers,
+            body,
+        }
     }
 
     async fn get(&self, uri: &str) -> TestResponse {
-        self.send(Request::get(uri).body(Body::empty()).unwrap()).await
+        self.send(Request::get(uri).body(Body::empty()).unwrap())
+            .await
     }
 
     async fn get_range(&self, uri: &str, range: &str) -> TestResponse {
-        let request = Request::get(uri).header(header::RANGE, range).body(Body::empty()).unwrap();
+        let request = Request::get(uri)
+            .header(header::RANGE, range)
+            .body(Body::empty())
+            .unwrap();
         self.send(request).await
     }
 
@@ -113,10 +137,18 @@ impl TestServer {
             match part {
                 Part::Text(name, value) => {
                     body.extend_from_slice(
-                        format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes(),
+                        format!(
+                            "Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                        )
+                        .as_bytes(),
                     );
                 }
-                Part::File { name, file_name, content_type, bytes } => {
+                Part::File {
+                    name,
+                    file_name,
+                    content_type,
+                    bytes,
+                } => {
                     body.extend_from_slice(
                         format!(
                             "Content-Disposition: form-data; name=\"{name}\"; filename=\"{file_name}\"\r\n\
@@ -132,7 +164,10 @@ impl TestServer {
         body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
 
         let request = Request::post("/api/broadcasts")
-            .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={BOUNDARY}"))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
             .body(Body::from(body))
             .unwrap();
         self.send(request).await
@@ -143,10 +178,20 @@ impl TestServer {
         let response = self
             .post_registration(&[
                 Part::Text("title", title),
-                Part::File { name: "recording", file_name: "clip.mp4", content_type: "video/mp4", bytes: video },
+                Part::File {
+                    name: "recording",
+                    file_name: "clip.mp4",
+                    content_type: "video/mp4",
+                    bytes: video,
+                },
             ])
             .await;
-        assert_eq!(response.status, StatusCode::CREATED, "{}", String::from_utf8_lossy(&response.body));
+        assert_eq!(
+            response.status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
         response.json()
     }
 
@@ -164,7 +209,12 @@ impl TestServer {
 
         let response = self.post_registration(parts).await;
 
-        assert_eq!(response.status, status, "{}", String::from_utf8_lossy(&response.body));
+        assert_eq!(
+            response.status,
+            status,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
         assert_eq!(response.error_message(), message);
         assert_eq!(self.list_broadcasts().await, before_list);
         assert_eq!(self.stored_file_count(), before_files);
@@ -172,7 +222,9 @@ impl TestServer {
 
     /// local 저장소에 남아 있는 파일 수.
     fn stored_file_count(&self) -> usize {
-        std::fs::read_dir(self.dir.path().join("recordings")).unwrap().count()
+        std::fs::read_dir(self.dir.path().join("recordings"))
+            .unwrap()
+            .count()
     }
 }
 
@@ -223,7 +275,12 @@ async fn webm_녹화본도_등록된다() {
     let response = server
         .post_registration(&[
             Part::Text("title", "webm 방송"),
-            Part::File { name: "recording", file_name: "clip.webm", content_type: "video/webm", bytes: b"webm" },
+            Part::File {
+                name: "recording",
+                file_name: "clip.webm",
+                content_type: "video/webm",
+                bytes: b"webm",
+            },
         ])
         .await;
 
@@ -262,7 +319,10 @@ async fn 녹화본_range_요청은_206과_해당_구간을_돌려준다() {
 
     let open_ended = server.get_range(&path, "bytes=900-").await;
     assert_eq!(open_ended.status, StatusCode::PARTIAL_CONTENT);
-    assert_eq!(open_ended.header(header::CONTENT_RANGE), "bytes 900-999/1000");
+    assert_eq!(
+        open_ended.header(header::CONTENT_RANGE),
+        "bytes 900-999/1000"
+    );
     assert_eq!(open_ended.body, video[900..]);
 
     let suffix = server.get_range(&path, "bytes=-50").await;
@@ -308,7 +368,12 @@ async fn 서버를_다시_시작해도_방송과_녹화본이_남아_있다() {
 }
 
 fn mp4(bytes: &[u8]) -> Part<'_> {
-    Part::File { name: "recording", file_name: "clip.mp4", content_type: "video/mp4", bytes }
+    Part::File {
+        name: "recording",
+        file_name: "clip.mp4",
+        content_type: "video/mp4",
+        bytes,
+    }
 }
 
 #[tokio::test]
@@ -317,9 +382,19 @@ async fn 제목이_없거나_공백이거나_너무_길면_400이다() {
     let video = sample_video(100);
     let too_long = "가".repeat(101);
 
-    server.assert_rejected(&[mp4(&video)], StatusCode::BAD_REQUEST, "제목을 입력해 주세요.").await;
     server
-        .assert_rejected(&[Part::Text("title", "   "), mp4(&video)], StatusCode::BAD_REQUEST, "제목을 입력해 주세요.")
+        .assert_rejected(
+            &[mp4(&video)],
+            StatusCode::BAD_REQUEST,
+            "제목을 입력해 주세요.",
+        )
+        .await;
+    server
+        .assert_rejected(
+            &[Part::Text("title", "   "), mp4(&video)],
+            StatusCode::BAD_REQUEST,
+            "제목을 입력해 주세요.",
+        )
         .await;
     server
         .assert_rejected(
@@ -330,7 +405,11 @@ async fn 제목이_없거나_공백이거나_너무_길면_400이다() {
         .await;
     // 녹화본이 제목보다 먼저 와서 이미 저장된 경우에도 정리된다.
     server
-        .assert_rejected(&[mp4(&video), Part::Text("title", " ")], StatusCode::BAD_REQUEST, "제목을 입력해 주세요.")
+        .assert_rejected(
+            &[mp4(&video), Part::Text("title", " ")],
+            StatusCode::BAD_REQUEST,
+            "제목을 입력해 주세요.",
+        )
         .await;
 }
 
@@ -339,7 +418,9 @@ async fn 제목은_앞뒤_공백을_빼고_100자까지_등록된다() {
     let server = TestServer::start().await;
     let title = "가".repeat(100);
 
-    let created = server.register(&format!("  {title}  "), &sample_video(10)).await;
+    let created = server
+        .register(&format!("  {title}  "), &sample_video(10))
+        .await;
 
     assert_eq!(created.title, title);
 }
@@ -349,7 +430,11 @@ async fn 녹화본이_없으면_400이다() {
     let server = TestServer::start().await;
 
     server
-        .assert_rejected(&[Part::Text("title", "녹화본 없음")], StatusCode::BAD_REQUEST, "녹화본 파일을 선택해 주세요.")
+        .assert_rejected(
+            &[Part::Text("title", "녹화본 없음")],
+            StatusCode::BAD_REQUEST,
+            "녹화본 파일을 선택해 주세요.",
+        )
         .await;
 }
 
@@ -357,12 +442,21 @@ async fn 녹화본이_없으면_400이다() {
 async fn mp4나_webm이_아니면_415다() {
     let server = TestServer::start().await;
 
-    for (file_name, content_type) in [("clip.mov", "video/quicktime"), ("notes.txt", "text/plain"), ("clip", "video/x-msvideo")] {
+    for (file_name, content_type) in [
+        ("clip.mov", "video/quicktime"),
+        ("notes.txt", "text/plain"),
+        ("clip", "video/x-msvideo"),
+    ] {
         server
             .assert_rejected(
                 &[
                     Part::Text("title", "형식 테스트"),
-                    Part::File { name: "recording", file_name, content_type, bytes: b"data" },
+                    Part::File {
+                        name: "recording",
+                        file_name,
+                        content_type,
+                        bytes: b"data",
+                    },
                 ],
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "mp4 또는 webm 영상만 등록할 수 있습니다.",
@@ -373,7 +467,11 @@ async fn mp4나_webm이_아니면_415다() {
 
 #[tokio::test]
 async fn 녹화본이_개별_상한을_넘으면_413이고_상한과_같으면_등록된다() {
-    let server = TestServer::with_limits(Limits { max_upload_bytes: 2048, storage_quota_bytes: 1024 * 1024 }).await;
+    let server = TestServer::with_limits(Limits {
+        max_upload_bytes: 2048,
+        storage_quota_bytes: 1024 * 1024,
+    })
+    .await;
 
     server
         .assert_rejected(
@@ -389,39 +487,71 @@ async fn 녹화본이_개별_상한을_넘으면_413이고_상한과_같으면_�
 
 #[tokio::test]
 async fn 저장_총량_한도를_넘으면_507이다() {
-    let server = TestServer::with_limits(Limits { max_upload_bytes: 1000, storage_quota_bytes: 1500 }).await;
+    let server = TestServer::with_limits(Limits {
+        max_upload_bytes: 1000,
+        storage_quota_bytes: 1500,
+    })
+    .await;
     let message = "저장 공간 한도에 도달해 더 이상 방송을 등록할 수 없습니다.";
 
     server.register("첫 방송", &sample_video(1000)).await;
     // 남은 500바이트보다 크다. 개별 상한(1000)보다는 작아도 저장 총량 때문에 거부된다.
     server
-        .assert_rejected(&[Part::Text("title", "두 번째"), mp4(&sample_video(600))], StatusCode::INSUFFICIENT_STORAGE, message)
+        .assert_rejected(
+            &[Part::Text("title", "두 번째"), mp4(&sample_video(600))],
+            StatusCode::INSUFFICIENT_STORAGE,
+            message,
+        )
         .await;
 
     server.register("남은 만큼", &sample_video(500)).await;
     server
-        .assert_rejected(&[Part::Text("title", "꽉 참"), mp4(&sample_video(1))], StatusCode::INSUFFICIENT_STORAGE, message)
+        .assert_rejected(
+            &[Part::Text("title", "꽉 참"), mp4(&sample_video(1))],
+            StatusCode::INSUFFICIENT_STORAGE,
+            message,
+        )
         .await;
 }
 
 #[tokio::test]
 async fn 업로드_한도는_남은_저장_공간을_반영한다() {
-    let server = TestServer::with_limits(Limits { max_upload_bytes: 1000, storage_quota_bytes: 1500 }).await;
+    let server = TestServer::with_limits(Limits {
+        max_upload_bytes: 1000,
+        storage_quota_bytes: 1500,
+    })
+    .await;
 
     let before: UploadPolicy = server.get(UPLOAD_POLICY_PATH).await.json();
-    assert_eq!(before, UploadPolicy { max_upload_bytes: 1000, remaining_bytes: 1500 });
+    assert_eq!(
+        before,
+        UploadPolicy {
+            max_upload_bytes: 1000,
+            remaining_bytes: 1500
+        }
+    );
 
     server.register("방송", &sample_video(400)).await;
 
     let after: UploadPolicy = server.get(UPLOAD_POLICY_PATH).await.json();
-    assert_eq!(after, UploadPolicy { max_upload_bytes: 1000, remaining_bytes: 1100 });
+    assert_eq!(
+        after,
+        UploadPolicy {
+            max_upload_bytes: 1000,
+            remaining_bytes: 1100
+        }
+    );
 }
 
 /// 빌드된 웹 정적 파일을 흉내 낸 디렉터리.
 fn fake_web_dist(dir: &TempDir) -> std::path::PathBuf {
     let dist = dir.path().join("web");
     std::fs::create_dir_all(dist.join("assets")).unwrap();
-    std::fs::write(dist.join("index.html"), "<!doctype html><title>clone-chzzk</title>").unwrap();
+    std::fs::write(
+        dist.join("index.html"),
+        "<!doctype html><title>clone-chzzk</title>",
+    )
+    .unwrap();
     std::fs::write(dist.join("assets/app.js"), "console.log('app')").unwrap();
     dist
 }
@@ -431,14 +561,28 @@ async fn 배포_시_서버가_웹_화면도_서빙하고_모르는_경로는_진
     let dir = tempfile::tempdir().unwrap();
     let mut config = TestServer::config(&dir, Limits::default());
     config.web_dist_dir = Some(fake_web_dist(&dir));
-    let server = TestServer { app: server::build_app(config).await.unwrap(), limits: Limits::default(), dir };
+    let server = TestServer {
+        app: server::build_app(config).await.unwrap(),
+        limits: Limits::default(),
+        dir,
+    };
     let created = server.register("공유할 방송", &sample_video(10)).await;
 
-    for path in ["/".to_owned(), format!("/broadcasts/{}", created.id), "/broadcasts/new".to_owned()] {
+    for path in [
+        "/".to_owned(),
+        format!("/broadcasts/{}", created.id),
+        "/broadcasts/new".to_owned(),
+    ] {
         let page = server.get(&path).await;
         assert_eq!(page.status, StatusCode::OK, "{path}");
-        assert!(page.header(header::CONTENT_TYPE).starts_with("text/html"), "{path}");
-        assert_eq!(page.body, b"<!doctype html><title>clone-chzzk</title>", "{path}");
+        assert!(
+            page.header(header::CONTENT_TYPE).starts_with("text/html"),
+            "{path}"
+        );
+        assert_eq!(
+            page.body, b"<!doctype html><title>clone-chzzk</title>",
+            "{path}"
+        );
     }
 
     let asset = server.get("/assets/app.js").await;

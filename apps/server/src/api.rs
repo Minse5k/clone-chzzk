@@ -138,17 +138,22 @@ async fn receive_registration(
         match field.name() {
             Some(registration_fields::TITLE) => {
                 // 제목이 녹화본보다 먼저 오면 큰 파일을 받기 전에 거부할 수 있다.
-                title = Some(validate_title(&field.text().await.map_err(upload_interrupted)?)?);
+                title = Some(validate_title(
+                    &field.text().await.map_err(upload_interrupted)?,
+                )?);
             }
             Some(registration_fields::RECORDING) => {
                 if saved.is_some() {
                     return Err(ApiError::bad_request("녹화본은 하나만 등록할 수 있습니다."));
                 }
-                let video = VideoType::detect(field.file_name(), field.content_type())
-                    .ok_or_else(|| ApiError::new(
-                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                        "mp4 또는 webm 영상만 등록할 수 있습니다.",
-                    ))?;
+                let video = VideoType::detect(field.file_name(), field.content_type()).ok_or_else(
+                    || {
+                        ApiError::new(
+                            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                            "mp4 또는 webm 영상만 등록할 수 있습니다.",
+                        )
+                    },
+                )?;
                 let limit = UploadLimit::for_new_recording(state).await?;
                 let object_key = format!("{id}.{}", video.extension());
 
@@ -161,16 +166,21 @@ async fn receive_registration(
                     }
                     Ok(chunk)
                 });
-                let size_bytes = state.store.put(&object_key, stream).await.map_err(|err| {
-                    match err.get_ref() {
-                        Some(inner) if inner.is::<LimitExceeded>() => limit.exceeded_error(),
-                        Some(inner) if inner.is::<MultipartError>() => {
-                            ApiError::bad_request("업로드가 중간에 끊겼습니다. 다시 시도해 주세요.")
+                let size_bytes =
+                    state.store.put(&object_key, stream).await.map_err(|err| {
+                        match err.get_ref() {
+                            Some(inner) if inner.is::<LimitExceeded>() => limit.exceeded_error(),
+                            Some(inner) if inner.is::<MultipartError>() => ApiError::bad_request(
+                                "업로드가 중간에 끊겼습니다. 다시 시도해 주세요.",
+                            ),
+                            _ => anyhow::Error::from(err).context("녹화본 저장 실패").into(),
                         }
-                        _ => anyhow::Error::from(err).context("녹화본 저장 실패").into(),
-                    }
-                })?;
-                *saved = Some(SavedRecording { object_key, content_type: video.content_type(), size_bytes });
+                    })?;
+                *saved = Some(SavedRecording {
+                    object_key,
+                    content_type: video.content_type(),
+                    size_bytes,
+                });
             }
             _ => {}
         }
@@ -207,7 +217,10 @@ impl UploadLimit {
         } else {
             ApiError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                format!("녹화본은 {} 이하만 등록할 수 있습니다.", format_bytes(self.max_upload_bytes)),
+                format!(
+                    "녹화본은 {} 이하만 등록할 수 있습니다.",
+                    format_bytes(self.max_upload_bytes)
+                ),
             )
         }
     }
@@ -231,7 +244,9 @@ fn validate_title(title: &str) -> Result<String, ApiError> {
         return Err(ApiError::bad_request("제목을 입력해 주세요."));
     }
     if title.chars().count() > TITLE_MAX_CHARS {
-        return Err(ApiError::bad_request(format!("제목은 {TITLE_MAX_CHARS}자 이하로 입력해 주세요.")));
+        return Err(ApiError::bad_request(format!(
+            "제목은 {TITLE_MAX_CHARS}자 이하로 입력해 주세요."
+        )));
     }
     Ok(title.to_owned())
 }
@@ -288,7 +303,8 @@ async fn play_recording(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let stored = find(&state, &id).await?;
-    let (Some(recording), Some(location)) = (stored.broadcast.recording, stored.recording_location) else {
+    let (Some(recording), Some(location)) = (stored.broadcast.recording, stored.recording_location)
+    else {
         return Err(ApiError::not_found("이 방송에는 녹화본이 없습니다."));
     };
     if location.storage_backend != state.store.backend_name() {
@@ -299,13 +315,21 @@ async fn play_recording(
             location.storage_backend,
             state.store.backend_name(),
         );
-        return Err(ApiError::not_found("이 녹화본은 지금 서버가 쓰는 저장소에 없습니다."));
+        return Err(ApiError::not_found(
+            "이 녹화본은 지금 서버가 쓰는 저장소에 없습니다.",
+        ));
     }
     let size = recording.size_bytes;
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
 
     let (status, range) = match range::parse(range_header, size) {
-        RangeRequest::Full => (StatusCode::OK, ByteRange { start: 0, len: size }),
+        RangeRequest::Full => (
+            StatusCode::OK,
+            ByteRange {
+                start: 0,
+                len: size,
+            },
+        ),
         RangeRequest::Partial(range) => (StatusCode::PARTIAL_CONTENT, range),
         RangeRequest::Unsatisfiable => {
             return Ok((
@@ -329,7 +353,10 @@ async fn play_recording(
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(range.len));
     if status == StatusCode::PARTIAL_CONTENT {
         let last = range.start + range.len - 1;
-        headers.insert(header::CONTENT_RANGE, header_value(&format!("bytes {}-{last}/{size}", range.start))?);
+        headers.insert(
+            header::CONTENT_RANGE,
+            header_value(&format!("bytes {}-{last}/{size}", range.start))?,
+        );
     }
     Ok(response)
 }
@@ -342,7 +369,9 @@ fn header_value(value: &str) -> Result<HeaderValue, ApiError> {
 async fn find(state: &AppState, id: &str) -> Result<db::StoredBroadcast, ApiError> {
     let not_found = || ApiError::not_found("방송을 찾을 수 없습니다.");
     let id = Uuid::parse_str(id).map_err(|_| not_found())?;
-    db::find_broadcast(&state.db, id).await?.ok_or_else(not_found)
+    db::find_broadcast(&state.db, id)
+        .await?
+        .ok_or_else(not_found)
 }
 
 /// API 오류. 본문에 사용자에게 보여 줄 한국어 메시지를 담는다.
@@ -354,7 +383,10 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into() }
+        Self {
+            status,
+            message: message.into(),
+        }
     }
 
     fn bad_request(message: impl Into<String>) -> Self {

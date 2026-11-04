@@ -224,7 +224,11 @@ fn BroadcastRegistration() -> Element {
         }
         let file = selected_recording();
         // 서버도 같은 검사를 하지만, 큰 파일을 다 올린 뒤에 거부되지 않도록 먼저 확인한다.
-        let current_policy = policy.read().as_ref().and_then(|p| p.as_ref().ok()).cloned();
+        let current_policy = policy
+            .read()
+            .as_ref()
+            .and_then(|p| p.as_ref().ok())
+            .cloned();
         if let Err(message) = check_registration(&title(), file.as_ref(), current_policy.as_ref()) {
             error.set(Some(message));
             return;
@@ -234,7 +238,9 @@ fn BroadcastRegistration() -> Element {
         error.set(None);
         match api::register_broadcast(&title(), &file).await {
             Ok(broadcast) => {
-                navigator.push(Route::BroadcastDetail { id: broadcast.id.to_string() });
+                navigator.push(Route::BroadcastDetail {
+                    id: broadcast.id.to_string(),
+                });
             }
             Err(message) => {
                 error.set(Some(message));
@@ -299,7 +305,10 @@ fn check_registration(
     if let Some(policy) = policy {
         let size = file.size() as u64;
         if size > policy.max_upload_bytes {
-            return Err(format!("녹화본은 {} 이하만 등록할 수 있습니다.", format_bytes(policy.max_upload_bytes)));
+            return Err(format!(
+                "녹화본은 {} 이하만 등록할 수 있습니다.",
+                format_bytes(policy.max_upload_bytes)
+            ));
         }
         if size > policy.remaining_bytes {
             return Err("저장 공간 한도에 도달해 더 이상 방송을 등록할 수 없습니다.".into());
@@ -321,5 +330,7 @@ fn selected_recording() -> Option<web_sys::File> {
 
 /// 등록 시각을 보는 사람의 시간대로 표시한다.
 fn format_time(time: DateTime<Utc>) -> String {
-    time.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string()
+    time.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
 }

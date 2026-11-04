@@ -37,7 +37,11 @@ pub async fn build_app(config: Config) -> anyhow::Result<Router> {
         Some(dir) => Some(web_service(dir)?),
         None => None,
     };
-    let state = AppState { db, store: Arc::new(store), config: Arc::new(config) };
+    let state = AppState {
+        db,
+        store: Arc::new(store),
+        config: Arc::new(config),
+    };
 
     let mut router = api::router().with_state(state);
     if let Some(web) = web {

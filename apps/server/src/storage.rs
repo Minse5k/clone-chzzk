@@ -88,7 +88,9 @@ impl LocalStore {
         tokio::fs::create_dir_all(dir)
             .await
             .with_context(|| format!("저장 디렉터리를 만들 수 없습니다: {}", dir.display()))?;
-        Ok(Self { dir: dir.to_owned() })
+        Ok(Self {
+            dir: dir.to_owned(),
+        })
     }
 
     fn path(&self, key: &str) -> PathBuf {
@@ -191,7 +193,11 @@ impl OciStore {
     where
         S: Stream<Item = io::Result<Bytes>> + Send,
     {
-        let upload = self.s3.put_multipart(&self.path(key)).await.map_err(io::Error::other)?;
+        let upload = self
+            .s3
+            .put_multipart(&self.path(key))
+            .await
+            .map_err(io::Error::other)?;
         let mut writer = WriteMultipart::new_with_chunk_size(upload, Self::PART_BYTES);
         let mut written = 0;
         let mut stream = std::pin::pin!(stream);
@@ -231,7 +237,9 @@ impl OciStore {
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
         match self.s3.delete(&self.path(key)).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(err) => Err(err).with_context(|| format!("OCI에서 녹화본을 지울 수 없습니다: {key}")),
+            Err(err) => {
+                Err(err).with_context(|| format!("OCI에서 녹화본을 지울 수 없습니다: {key}"))
+            }
         }
     }
 }
