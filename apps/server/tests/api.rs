@@ -85,6 +85,7 @@ impl TestServer {
             cors_allowed_origins: vec!["http://localhost:8080".into()],
             max_upload_bytes: limits.max_upload_bytes,
             storage_quota_bytes: limits.storage_quota_bytes,
+            web_dist_dir: None,
         }
     }
 
@@ -414,4 +415,50 @@ async fn 업로드_한도는_남은_저장_공간을_반영한다() {
 
     let after: UploadPolicy = server.get(UPLOAD_POLICY_PATH).await.json();
     assert_eq!(after, UploadPolicy { max_upload_bytes: 1000, remaining_bytes: 1100 });
+}
+
+/// 빌드된 웹 정적 파일을 흉내 낸 디렉터리.
+fn fake_web_dist(dir: &TempDir) -> std::path::PathBuf {
+    let dist = dir.path().join("web");
+    std::fs::create_dir_all(dist.join("assets")).unwrap();
+    std::fs::write(dist.join("index.html"), "<!doctype html><title>clone-chzzk</title>").unwrap();
+    std::fs::write(dist.join("assets/app.js"), "console.log('app')").unwrap();
+    dist
+}
+
+#[tokio::test]
+async fn 배포_시_서버가_웹_화면도_서빙하고_모르는_경로는_진입_html로_답한다() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = TestServer::config(&dir, Limits::default());
+    config.web_dist_dir = Some(fake_web_dist(&dir));
+    let server = TestServer { app: server::build_app(config).await.unwrap(), limits: Limits::default(), dir };
+    let created = server.register("공유할 방송", &sample_video(10)).await;
+
+    for path in ["/".to_owned(), format!("/broadcasts/{}", created.id), "/broadcasts/new".to_owned()] {
+        let page = server.get(&path).await;
+        assert_eq!(page.status, StatusCode::OK, "{path}");
+        assert!(page.header(header::CONTENT_TYPE).starts_with("text/html"), "{path}");
+        assert_eq!(page.body, b"<!doctype html><title>clone-chzzk</title>", "{path}");
+    }
+
+    let asset = server.get("/assets/app.js").await;
+    assert_eq!(asset.status, StatusCode::OK);
+    assert_eq!(asset.body, b"console.log('app')");
+
+    // API 경로는 웹 화면으로 대체되지 않는다.
+    assert_eq!(server.list_broadcasts().await, vec![created]);
+    let unknown_api = server.get("/api/nope").await;
+    assert_eq!(unknown_api.status, StatusCode::NOT_FOUND);
+    assert_eq!(unknown_api.error_message(), "없는 API입니다.");
+}
+
+#[tokio::test]
+async fn 웹_정적_파일_디렉터리에_index_html이_없으면_시작하지_않는다() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = TestServer::config(&dir, Limits::default());
+    config.web_dist_dir = Some(dir.path().join("empty"));
+
+    let error = server::build_app(config).await.err().unwrap();
+
+    assert!(error.to_string().contains("index.html"), "{error}");
 }

@@ -15,6 +15,8 @@ pub struct Config {
     pub max_upload_bytes: u64,
     /// 저장된 녹화본 크기 합의 한도. OCI 무료 한도(20GB)를 넘지 않게 여유를 둔다.
     pub storage_quota_bytes: u64,
+    /// 빌드된 웹 정적 파일 디렉터리. 지정하면 서버가 웹 화면도 함께 서빙한다(배포 시).
+    pub web_dist_dir: Option<PathBuf>,
 }
 
 /// 녹화본 저장소 백엔드. `STORAGE_BACKEND`로 고른다(기본 `local`).
@@ -99,6 +101,10 @@ impl Config {
                 .collect(),
             max_upload_bytes: env_bytes("MAX_UPLOAD_BYTES", 2 * GIB)?,
             storage_quota_bytes: env_bytes("STORAGE_QUOTA_BYTES", 15 * GIB)?,
+            web_dist_dir: env::var("WEB_DIST_DIR")
+                .ok()
+                .filter(|dir| !dir.trim().is_empty())
+                .map(PathBuf::from),
         })
     }
 }

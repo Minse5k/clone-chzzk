@@ -6,7 +6,7 @@ mod db;
 mod range;
 mod storage;
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use anyhow::Context;
 use axum::{Router, http::HeaderValue};
@@ -14,6 +14,7 @@ use sqlx::SqlitePool;
 use storage::RecordingStore;
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
+    services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 
@@ -32,12 +33,29 @@ pub async fn build_app(config: Config) -> anyhow::Result<Router> {
     let store = RecordingStore::open(&config.storage).await?;
     let db = db::connect(&config.database_path).await?;
     let cors = cors_layer(&config.cors_allowed_origins)?;
+    let web = match &config.web_dist_dir {
+        Some(dir) => Some(web_service(dir)?),
+        None => None,
+    };
     let state = AppState { db, store: Arc::new(store), config: Arc::new(config) };
 
-    Ok(api::router()
-        .with_state(state)
-        .layer(cors)
-        .layer(TraceLayer::new_for_http()))
+    let mut router = api::router().with_state(state);
+    if let Some(web) = web {
+        router = router.fallback_service(web);
+    }
+    Ok(router.layer(cors).layer(TraceLayer::new_for_http()))
+}
+
+/// 빌드된 웹 정적 파일. 파일이 없는 경로는 웹 진입 HTML로 답해,
+/// 공유 URL(`/broadcasts/{id}`)로 바로 들어오거나 새로고침해도 웹 라우터가 화면을 그린다.
+fn web_service(dir: &Path) -> anyhow::Result<ServeDir<ServeFile>> {
+    let index = dir.join("index.html");
+    anyhow::ensure!(
+        index.is_file(),
+        "WEB_DIST_DIR에 index.html이 없습니다: {} (`dx build -p web --release` 결과의 public 디렉터리를 지정하세요)",
+        dir.display()
+    );
+    Ok(ServeDir::new(dir).fallback(ServeFile::new(index)))
 }
 
 fn cors_layer(origins: &[String]) -> anyhow::Result<CorsLayer> {

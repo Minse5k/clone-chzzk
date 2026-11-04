@@ -54,6 +54,7 @@ dx serve -p web
 | `MAX_UPLOAD_BYTES` | `2147483648` (2GiB) | 녹화본 하나의 최대 크기. 넘으면 413 |
 | `STORAGE_QUOTA_BYTES` | `16106127360` (15GiB) | 저장된 녹화본 크기 합의 한도. 넘으면 507 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:8080` | 허용할 웹 출처(쉼표 구분, `*`는 전체) |
+| `WEB_DIST_DIR` | (없음) | 빌드된 웹 정적 파일 디렉터리. 지정하면 서버가 웹 화면도 서빙한다(배포용) |
 | `API_BASE_URL` | `http://localhost:3000` | (웹 빌드 시) 웹이 호출할 서버 주소 |
 
 ## 녹화본 저장소
@@ -91,6 +92,17 @@ dx serve -p web
 | 507 | 등록하면 녹화본 크기 합이 `STORAGE_QUOTA_BYTES`를 넘음 |
 
 거부된 등록은 목록에 나타나지 않고 저장소에 파일을 남기지 않는다.
+
+## 배포
+
+OCI(오사카 리전) Always Free 범위 안에서 A1 VM 1대 + 비공개 Object Storage 버킷으로 배포한다. 콘솔에서 자원을 만드는 순서와 과금 확인 포인트는 [docs/deploy-oci.md](docs/deploy-oci.md)에 있다.
+
+VM에서는 Docker Compose로 앱과 Caddy 리버스 프록시를 띄운다. 앱 컨테이너 하나가 API와 빌드된 웹 화면을 같은 주소로 서빙한다.
+
+```bash
+cp .env.example .env   # STORAGE_BACKEND=oci 와 OCI_* 값을 채운다(커밋 금지)
+docker compose up -d --build
+```
 
 ## 테스트
 

@@ -6,7 +6,7 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, State, multipart::MultipartError},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{any, get},
 };
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -36,6 +36,12 @@ pub fn router() -> Router<AppState> {
         .route(UPLOAD_POLICY_PATH, get(upload_policy))
         .route("/api/broadcasts/{id}", get(get_broadcast))
         .route("/api/broadcasts/{id}/recording", get(play_recording))
+        // 웹 정적 파일 대체 응답이 없는 API 경로를 가로채지 않도록 먼저 404로 답한다.
+        .route("/api/{*rest}", any(unknown_api))
+}
+
+async fn unknown_api() -> ApiError {
+    ApiError::not_found("없는 API입니다.")
 }
 
 async fn list_broadcasts(State(state): State<AppState>) -> Result<Json<Vec<Broadcast>>, ApiError> {
