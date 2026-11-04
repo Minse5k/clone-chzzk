@@ -81,7 +81,7 @@ impl TestServer {
     fn config(dir: &TempDir, limits: Limits) -> server::Config {
         server::Config {
             database_path: dir.path().join("test.db"),
-            storage_dir: dir.path().join("recordings"),
+            storage: server::StorageConfig::Local { dir: dir.path().join("recordings") },
             cors_allowed_origins: vec!["http://localhost:8080".into()],
             max_upload_bytes: limits.max_upload_bytes,
             storage_quota_bytes: limits.storage_quota_bytes,

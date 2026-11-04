@@ -285,6 +285,16 @@ async fn play_recording(
     let (Some(recording), Some(location)) = (stored.broadcast.recording, stored.recording_location) else {
         return Err(ApiError::not_found("이 방송에는 녹화본이 없습니다."));
     };
+    if location.storage_backend != state.store.backend_name() {
+        // 위치는 DB에 남아 있으므로, 원래 저장소로 되돌리거나 녹화본을 옮기면 다시 재생된다.
+        tracing::warn!(
+            "녹화본 {}은 {} 저장소에 있지만 서버는 {} 저장소를 쓰고 있습니다",
+            location.object_key,
+            location.storage_backend,
+            state.store.backend_name(),
+        );
+        return Err(ApiError::not_found("이 녹화본은 지금 서버가 쓰는 저장소에 없습니다."));
+    }
     let size = recording.size_bytes;
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
 

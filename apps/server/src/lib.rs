@@ -11,13 +11,13 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::{Router, http::HeaderValue};
 use sqlx::SqlitePool;
-use storage::{LocalStore, RecordingStore};
+use storage::RecordingStore;
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
     trace::TraceLayer,
 };
 
-pub use config::{Config, server_addr_from_env};
+pub use config::{Config, OciStorageConfig, StorageConfig, server_addr_from_env};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,7 +29,7 @@ pub struct AppState {
 /// 설정으로 DB와 저장소를 준비하고 HTTP 라우터를 만든다.
 /// 같은 설정으로 다시 부르면 기존 데이터를 그대로 이어서 쓴다.
 pub async fn build_app(config: Config) -> anyhow::Result<Router> {
-    let store = RecordingStore::Local(LocalStore::open(&config.storage_dir).await?);
+    let store = RecordingStore::open(&config.storage).await?;
     let db = db::connect(&config.database_path).await?;
     let cors = cors_layer(&config.cors_allowed_origins)?;
     let state = AppState { db, store: Arc::new(store), config: Arc::new(config) };

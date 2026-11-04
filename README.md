@@ -44,11 +44,32 @@ dx serve -p web
 |---|---|---|
 | `SERVER_ADDR` | `0.0.0.0:3000` | 서버 바인딩 주소 |
 | `DATABASE_PATH` | `data/chzzk.db` | SQLite 파일 경로 |
+| `STORAGE_BACKEND` | `local` | 녹화본 저장소. `local` 또는 `oci` |
 | `STORAGE_DIR` | `data/recordings` | local 저장소 디렉터리 |
+| `OCI_S3_ENDPOINT` | — | (oci) S3 호환 엔드포인트 `https://<namespace>.compat.objectstorage.<region>.oraclecloud.com` |
+| `OCI_REGION` | — | (oci) 리전. 예: `ap-osaka-1` |
+| `OCI_BUCKET` | — | (oci) 비공개 버킷 이름 |
+| `OCI_ACCESS_KEY_ID` | — | (oci) Customer Secret Key의 Access Key |
+| `OCI_SECRET_ACCESS_KEY` | — | (oci) Customer Secret Key의 Secret Key |
 | `MAX_UPLOAD_BYTES` | `2147483648` (2GiB) | 녹화본 하나의 최대 크기. 넘으면 413 |
 | `STORAGE_QUOTA_BYTES` | `16106127360` (15GiB) | 저장된 녹화본 크기 합의 한도. 넘으면 507 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:8080` | 허용할 웹 출처(쉼표 구분, `*`는 전체) |
 | `API_BASE_URL` | `http://localhost:3000` | (웹 빌드 시) 웹이 호출할 서버 주소 |
+
+## 녹화본 저장소
+
+기본값 `STORAGE_BACKEND=local`은 서버 디렉터리(`STORAGE_DIR`)에 녹화본을 저장하며 비밀 값이 필요 없다.
+
+`STORAGE_BACKEND=oci`로 두면 OCI Object Storage의 **비공개 버킷**에 S3 호환 API로 저장한다. 업로드는 8MB 단위 멀티파트로 스트리밍되고, 재생은 서버가 Range 요청을 버킷으로 그대로 넘긴다(버킷을 공개할 필요 없음). 설계 근거는 [ADR 0002](docs/adr/0002-recordings-proxied-through-server.md).
+
+1. OCI 콘솔에서 버킷을 만든다(공개 범위: Private).
+2. 프로필 > 사용자 설정 > **Customer Secret Keys**에서 키를 발급한다(Secret Key는 발급 직후에만 보인다).
+3. Object Storage 화면의 **Namespace**로 엔드포인트를 만든다: `https://<namespace>.compat.objectstorage.<region>.oraclecloud.com`
+4. 위 표의 `OCI_*` 환경변수를 실행 환경에만 지정하고 서버를 시작한다.
+
+설정이 빠졌거나 버킷에 접근할 수 없으면 서버는 시작하지 않고 원인을 출력한다. 각 녹화본이 어느 저장소에 있는지는 DB에 기록되므로, 저장소를 바꿔도 기존 녹화본의 위치는 남는다(다른 저장소에 있는 녹화본은 원래 저장소로 되돌리기 전까지 재생되지 않는다).
+
+> ⚠️ OCI Object Storage의 Always Free 한도는 20GB다. 한도를 넘으면 PAYG 계정에서는 과금되므로 `STORAGE_QUOTA_BYTES`(기본 15GiB)를 그보다 작게 유지한다.
 
 ## API
 
