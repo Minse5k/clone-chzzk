@@ -1,0 +1,40 @@
+# 배포용 구성: 앱(서버 + 웹) 컨테이너와 그 앞의 Caddy 리버스 프록시.
+# 비밀 값은 저장소에 없는 .env 파일로만 넣는다(.env.example 참고).
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    # 컨테이너 안의 경로는 이미지에 맞춰 고정한다(.env에 로컬 개발용 값이 있어도 이 값이 우선한다).
+    environment:
+      SERVER_ADDR: 0.0.0.0:3000
+      WEB_DIST_DIR: /app/web
+      DATABASE_PATH: /data/chzzk.db
+      STORAGE_DIR: /data/recordings
+    volumes:
+      - app-data:/data
+    expose:
+      - "3000"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # 지금은 공인 IP + HTTP(:80). 도메인이 생기면 SITE_ADDRESS=example.com 으로 두면 HTTPS 인증서가 자동으로 붙는다.
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  app-data: # SQLite 파일과 local 저장소 녹화본
+  caddy-data:
+  caddy-config:

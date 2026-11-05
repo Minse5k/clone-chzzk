@@ -1,0 +1,6 @@
+{$SITE_ADDRESS::80} {
+	# 녹화본 업로드·재생은 큰 스트림이므로 버퍼링하지 않고 바로 흘려보낸다.
+	reverse_proxy app:3000 {
+		flush_interval -1
+	}
+}

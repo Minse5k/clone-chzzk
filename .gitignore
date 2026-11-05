@@ -1,0 +1,5 @@
+/target
+/data
+.env
+/apps/web/dist
+.claude/launch.json
