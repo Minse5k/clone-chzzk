@@ -4,7 +4,7 @@ mod api;
 
 use chrono::{DateTime, Local, Utc};
 use dioxus::prelude::*;
-use shared::{TITLE_MAX_CHARS, UploadPolicy, format_bytes};
+use shared::{Broadcast, BroadcastStatus, TITLE_MAX_CHARS, UploadPolicy, format_bytes};
 use wasm_bindgen::JsCast;
 use web_sys::HtmlInputElement;
 
@@ -58,25 +58,63 @@ fn BroadcastList() -> Element {
         match &*broadcasts.read() {
             None => rsx! { p { class: "notice", "불러오는 중…" } },
             Some(Err(message)) => rsx! { p { class: "notice error", "{message}" } },
-            Some(Ok(list)) if list.is_empty() => rsx! {
-                p { class: "notice", "등록된 방송이 없습니다." }
-            },
-            Some(Ok(list)) => rsx! {
+            Some(Ok(list)) => {
+                let (live, ended): (Vec<_>, Vec<_>) = list
+                    .iter()
+                    .cloned()
+                    .partition(|broadcast| broadcast.status == BroadcastStatus::Live);
+                rsx! {
+                    BroadcastSection {
+                        heading: "라이브 중",
+                        empty: "지금 라이브 중인 방송이 없습니다.",
+                        broadcasts: live,
+                    }
+                    BroadcastSection {
+                        heading: "지난 방송",
+                        empty: "등록된 방송이 없습니다.",
+                        broadcasts: ended,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 같은 상태의 방송 묶음. 비어 있으면 안내 문구를 보여 준다.
+#[component]
+fn BroadcastSection(heading: String, empty: String, broadcasts: Vec<Broadcast>) -> Element {
+    rsx! {
+        section { class: "broadcast-section",
+            h2 { "{heading}" }
+            if broadcasts.is_empty() {
+                p { class: "notice", "{empty}" }
+            } else {
                 ul { class: "broadcast-list",
-                    for broadcast in list {
+                    for broadcast in broadcasts {
                         li { key: "{broadcast.id}",
                             Link {
                                 class: "broadcast-card",
                                 to: Route::BroadcastDetail { id: broadcast.id.to_string() },
+                                StatusBadge { status: broadcast.status }
                                 span { class: "title", "{broadcast.title}" }
                                 span { class: "meta", {format_time(broadcast.created_at)} }
                             }
                         }
                     }
                 }
-            },
+            }
         }
     }
+}
+
+/// 방송 상태 배지. 라이브 중이면 눈에 띄게 표시한다.
+#[component]
+fn StatusBadge(status: BroadcastStatus) -> Element {
+    let class = match status {
+        BroadcastStatus::Live => "badge live",
+        BroadcastStatus::Ended => "badge ended",
+    };
+    rsx! { span { class, {status.label()} } }
 }
 
 #[component]
@@ -102,8 +140,16 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
                 } else {
                     p { class: "notice", "이 방송에는 녹화본이 없습니다." }
                 }
-                h1 { "{broadcast.title}" }
-                p { class: "meta", "등록 " {format_time(broadcast.created_at)} }
+                div { class: "title-row",
+                    StatusBadge { status: broadcast.status }
+                    h1 { "{broadcast.title}" }
+                }
+                p { class: "meta",
+                    match broadcast.status {
+                        BroadcastStatus::Live => rsx! { "송출 시작 " {format_time(broadcast.created_at)} },
+                        BroadcastStatus::Ended => rsx! { "등록 " {format_time(broadcast.created_at)} },
+                    }
+                }
                 ShareUrl { id: broadcast.id.to_string() }
             }
         },

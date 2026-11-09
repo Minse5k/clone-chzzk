@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use chrono::{DateTime, SecondsFormat, Utc};
-use shared::{Broadcast, Recording};
+use shared::{Broadcast, BroadcastStatus, Recording};
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode},
@@ -44,7 +44,8 @@ pub struct StoredBroadcast {
     pub recording_location: Option<RecordingLocation>,
 }
 
-/// 새로 등록할 방송. 녹화본은 이미 저장소에 저장된 상태여야 한다.
+/// 새로 등록할 방송. 방송 등록으로 생긴 방송은 등록 시각에 이미 종료된 방송이다.
+/// 녹화본은 이미 저장소에 저장된 상태여야 한다.
 pub struct NewBroadcast {
     pub id: Uuid,
     pub title: String,
@@ -58,6 +59,7 @@ struct BroadcastRow {
     id: String,
     title: String,
     created_at: String,
+    ended_at: Option<String>,
     storage_backend: Option<String>,
     object_key: Option<String>,
     content_type: Option<String>,
@@ -86,11 +88,14 @@ impl TryFrom<BroadcastRow> for StoredBroadcast {
             ),
             _ => (None, None),
         };
+        let ended_at = row.ended_at.as_deref().map(parse_time).transpose()?;
         Ok(Self {
             broadcast: Broadcast {
                 id: Uuid::parse_str(&row.id)?,
                 title: row.title,
-                created_at: DateTime::parse_from_rfc3339(&row.created_at)?.with_timezone(&Utc),
+                created_at: parse_time(&row.created_at)?,
+                status: BroadcastStatus::from_ended_at(ended_at),
+                ended_at,
                 recording,
             },
             recording_location,
@@ -98,15 +103,32 @@ impl TryFrom<BroadcastRow> for StoredBroadcast {
     }
 }
 
+fn parse_time(text: &str) -> anyhow::Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(text)?.with_timezone(&Utc))
+}
+
+/// 고정 자릿수 UTC라 문자열 정렬이 시간 순서와 같다.
+fn format_time(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
 const SELECT_BROADCASTS: &str = "\
-    SELECT b.id, b.title, b.created_at, \
+    SELECT b.id, b.title, b.created_at, b.ended_at, \
            r.storage_backend, r.object_key, r.content_type, r.size_bytes \
     FROM broadcasts b LEFT JOIN recordings r ON r.broadcast_id = b.id";
 
-/// 방송 목록, 최신 등록순.
-pub async fn list_broadcasts(pool: &SqlitePool) -> anyhow::Result<Vec<Broadcast>> {
+/// 방송 목록, 최신 등록순. 상태를 주면 그 상태의 방송만 돌려준다.
+pub async fn list_broadcasts(
+    pool: &SqlitePool,
+    status: Option<BroadcastStatus>,
+) -> anyhow::Result<Vec<Broadcast>> {
+    let filter = match status {
+        None => "",
+        Some(BroadcastStatus::Live) => "WHERE b.ended_at IS NULL",
+        Some(BroadcastStatus::Ended) => "WHERE b.ended_at IS NOT NULL",
+    };
     sqlx::query_as::<_, BroadcastRow>(sqlx::AssertSqlSafe(format!(
-        "{SELECT_BROADCASTS} ORDER BY b.created_at DESC, b.id DESC"
+        "{SELECT_BROADCASTS} {filter} ORDER BY b.created_at DESC, b.id DESC"
     )))
     .fetch_all(pool)
     .await?
@@ -165,11 +187,12 @@ pub async fn insert_broadcast(
     if u64::try_from(total)?.saturating_add(new.recording.size_bytes) > storage_quota_bytes {
         return Err(InsertError::QuotaExceeded);
     }
-    sqlx::query("INSERT INTO broadcasts (id, title, created_at) VALUES (?, ?, ?)")
+    let created_at = format_time(new.created_at);
+    sqlx::query("INSERT INTO broadcasts (id, title, created_at, ended_at) VALUES (?, ?, ?, ?)")
         .bind(new.id.to_string())
         .bind(&new.title)
-        // 고정 자릿수 UTC라 문자열 정렬이 시간 순서와 같다.
-        .bind(new.created_at.to_rfc3339_opts(SecondsFormat::Micros, true))
+        .bind(&created_at)
+        .bind(&created_at)
         .execute(&mut *tx)
         .await?;
     sqlx::query(

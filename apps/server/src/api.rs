@@ -3,17 +3,18 @@ use std::io;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path, State, multipart::MultipartError},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State, multipart::MultipartError},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{any, get},
 };
 use chrono::Utc;
 use futures_util::StreamExt;
+use serde::Deserialize;
 use serde_json::json;
 use shared::{
-    Broadcast, Recording, TITLE_MAX_CHARS, UPLOAD_POLICY_PATH, UploadPolicy, format_bytes,
-    registration_fields,
+    Broadcast, BroadcastStatus, Recording, TITLE_MAX_CHARS, UPLOAD_POLICY_PATH, UploadPolicy,
+    format_bytes, registration_fields,
 };
 use uuid::Uuid;
 
@@ -44,8 +45,23 @@ async fn unknown_api() -> ApiError {
     ApiError::not_found("없는 API입니다.")
 }
 
-async fn list_broadcasts(State(state): State<AppState>) -> Result<Json<Vec<Broadcast>>, ApiError> {
-    Ok(Json(db::list_broadcasts(&state.db).await?))
+#[derive(Deserialize)]
+struct ListQuery {
+    status: Option<String>,
+}
+
+/// 방송 목록. `?status=live|ended`로 상태를 거를 수 있다.
+async fn list_broadcasts(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Vec<Broadcast>>, ApiError> {
+    let status = match query.status.as_deref() {
+        None => None,
+        Some(value) => Some(BroadcastStatus::parse(value).ok_or_else(|| {
+            ApiError::bad_request("방송 상태는 live 또는 ended만 쓸 수 있습니다.")
+        })?),
+    };
+    Ok(Json(db::list_broadcasts(&state.db, status).await?))
 }
 
 /// 지금 등록할 수 있는 녹화본 크기. 웹이 업로드 전에 확인한다.
@@ -104,6 +120,8 @@ async fn register_broadcast(
             id: new.id,
             title: new.title,
             created_at: new.created_at,
+            status: BroadcastStatus::Ended,
+            ended_at: Some(new.created_at),
             recording: Some(new.recording),
         })
     }
