@@ -3,9 +3,10 @@
 use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::{Deserialize, de::DeserializeOwned};
 use shared::{
-    AuthResponse, Broadcast, Credentials, LOGIN_PATH, LOGOUT_PATH, ME_PATH, SIGNUP_PATH,
-    UPLOAD_POLICY_PATH, UpdateBroadcast, UploadPolicy, User, broadcast_end_path, broadcast_path,
-    live_playlist_path, recording_path, registration_fields,
+    AuthResponse, Broadcast, Comment, Credentials, LOGIN_PATH, LOGOUT_PATH, ME_PATH, NewComment,
+    SIGNUP_PATH, UPLOAD_POLICY_PATH, UpdateBroadcast, UploadPolicy, User, broadcast_end_path,
+    broadcast_path, comment_path, comments_path, live_playlist_path, recording_path,
+    registration_fields,
 };
 use uuid::Uuid;
 use web_sys::{File, FormData};
@@ -172,6 +173,42 @@ pub async fn end_broadcast(id: Uuid) -> ApiResult<Broadcast> {
             .await,
     )
     .await
+}
+
+/// 방송의 댓글 목록, 오래된 순.
+pub async fn list_comments(broadcast_id: Uuid) -> ApiResult<Vec<Comment>> {
+    read_json(
+        Request::get(&url(&comments_path(broadcast_id)))
+            .send()
+            .await,
+    )
+    .await
+}
+
+/// 댓글을 쓴다(로그인 필요).
+pub async fn create_comment(broadcast_id: Uuid, body: &str) -> ApiResult<Comment> {
+    let request = authorized(Request::post(&url(&comments_path(broadcast_id))))
+        .json(&NewComment {
+            body: body.to_owned(),
+        })
+        .map_err(|_| "요청을 준비할 수 없습니다.".to_owned())?;
+    read_json(request.send().await).await
+}
+
+/// 댓글을 지운다(작성자만).
+pub async fn delete_comment(broadcast_id: Uuid, comment_id: Uuid) -> ApiResult<()> {
+    let response = authorized(Request::delete(&url(&comment_path(
+        broadcast_id,
+        comment_id,
+    ))))
+    .send()
+    .await
+    .map_err(|_| "서버에 연결할 수 없습니다.".to_owned())?;
+    if response.ok() {
+        Ok(())
+    } else {
+        Err(error_message(response).await)
+    }
 }
 
 #[derive(Deserialize)]

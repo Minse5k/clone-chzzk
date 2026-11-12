@@ -465,3 +465,95 @@ pub async fn remove_pending_deletion(
     .await?;
     Ok(())
 }
+
+/// 댓글을 기록한다. 방송이 없으면(그사이 삭제됨) `Ok(false)`.
+pub async fn insert_comment(pool: &SqlitePool, comment: &shared::Comment) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "INSERT INTO comments (id, broadcast_id, author_id, body, created_at) \
+         SELECT ?, id, ?, ?, ? FROM broadcasts WHERE id = ?",
+    )
+    .bind(comment.id.to_string())
+    .bind(comment.author.id.to_string())
+    .bind(&comment.body)
+    .bind(format_time(comment.created_at))
+    .bind(comment.broadcast_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+#[derive(sqlx::FromRow)]
+struct CommentRow {
+    id: String,
+    broadcast_id: String,
+    author_id: String,
+    author_username: String,
+    body: String,
+    created_at: String,
+}
+
+impl TryFrom<CommentRow> for shared::Comment {
+    type Error = anyhow::Error;
+
+    fn try_from(row: CommentRow) -> anyhow::Result<Self> {
+        Ok(Self {
+            id: Uuid::parse_str(&row.id)?,
+            broadcast_id: Uuid::parse_str(&row.broadcast_id)?,
+            author: shared::User {
+                id: Uuid::parse_str(&row.author_id)?,
+                username: row.author_username,
+            },
+            body: row.body,
+            created_at: parse_time(&row.created_at)?,
+        })
+    }
+}
+
+const SELECT_COMMENTS: &str = "\
+    SELECT c.id, c.broadcast_id, c.author_id, u.username AS author_username, c.body, c.created_at \
+    FROM comments c JOIN users u ON u.id = c.author_id";
+
+/// 방송의 댓글, 오래된 순. 많으면 최근 `limit`개만 돌려준다.
+pub async fn list_comments(
+    pool: &SqlitePool,
+    broadcast_id: Uuid,
+    limit: usize,
+) -> anyhow::Result<Vec<shared::Comment>> {
+    let mut comments = sqlx::query_as::<_, CommentRow>(sqlx::AssertSqlSafe(format!(
+        "{SELECT_COMMENTS} WHERE c.broadcast_id = ? ORDER BY c.created_at DESC, c.id DESC LIMIT ?"
+    )))
+    .bind(broadcast_id.to_string())
+    .bind(i64::try_from(limit)?)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(shared::Comment::try_from)
+    .collect::<anyhow::Result<Vec<_>>>()?;
+    comments.reverse();
+    Ok(comments)
+}
+
+/// 방송에 속한 댓글 하나.
+pub async fn find_comment(
+    pool: &SqlitePool,
+    broadcast_id: Uuid,
+    comment_id: Uuid,
+) -> anyhow::Result<Option<shared::Comment>> {
+    sqlx::query_as::<_, CommentRow>(sqlx::AssertSqlSafe(format!(
+        "{SELECT_COMMENTS} WHERE c.id = ? AND c.broadcast_id = ?"
+    )))
+    .bind(comment_id.to_string())
+    .bind(broadcast_id.to_string())
+    .fetch_optional(pool)
+    .await?
+    .map(shared::Comment::try_from)
+    .transpose()
+}
+
+pub async fn delete_comment(pool: &SqlitePool, comment_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM comments WHERE id = ?")
+        .bind(comment_id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}

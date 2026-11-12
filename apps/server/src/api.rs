@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::{
     AppState,
     auth::{self, AuthUser},
+    comments,
     db::{self, DeleteOutcome, InsertError, NewBroadcast, RecordingLocation},
     live,
     range::{self, RangeRequest},
@@ -48,6 +49,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/broadcasts/{id}/live/{file}", get(live::serve_file))
         .route(LIVE_INGEST_PATH, any(live::ingest))
         .merge(auth::router())
+        .merge(comments::router())
         // 웹 정적 파일 대체 응답이 없는 API 경로를 가로채지 않도록 먼저 404로 답한다.
         .route("/api/{*rest}", any(unknown_api))
 }

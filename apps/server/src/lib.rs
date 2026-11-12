@@ -2,6 +2,7 @@
 
 mod api;
 mod auth;
+mod comments;
 mod config;
 mod db;
 mod live;

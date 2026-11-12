@@ -1,6 +1,7 @@
 //! clone-chzzk 웹 앱.
 
 mod api;
+mod comments;
 mod live;
 mod session;
 
@@ -409,6 +410,7 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
                     broadcast: broadcast.clone(),
                     on_changed: move |_| reload.restart(),
                 }
+                comments::CommentSection { key: "{broadcast.id}", broadcast_id: broadcast.id }
             }
         },
     }

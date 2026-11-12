@@ -1,63 +1,22 @@
 //! 회원가입·로그인·로그아웃 통합 테스트.
 
-use axum::{
-    Router,
-    body::Body,
-    http::{Request, StatusCode, header},
-};
-use http_body_util::BodyExt;
-use serde_json::{Value, json};
+mod common;
+
+use axum::http::StatusCode;
+use common::{Reply, TEST_JWT_SECRET, TestApp};
+use serde_json::json;
 use shared::{AuthResponse, LOGIN_PATH, LOGOUT_PATH, ME_PATH, SIGNUP_PATH, User};
-use tempfile::TempDir;
-use tower::ServiceExt;
 
-const TEST_JWT_SECRET: &str = "test-only-jwt-secret";
-
-struct AuthServer {
-    _dir: TempDir,
-    app: Router,
-}
-
-struct Reply {
-    status: StatusCode,
-    body: Vec<u8>,
-}
-
-impl Reply {
-    fn json<T: serde::de::DeserializeOwned>(&self) -> T {
-        serde_json::from_slice(&self.body).unwrap()
-    }
-
-    fn message(&self) -> String {
-        self.json::<Value>()["message"].as_str().unwrap().to_owned()
-    }
-}
+/// 가입·로그인 요청을 보내는 테스트 서버.
+struct AuthServer(TestApp);
 
 impl AuthServer {
     async fn start() -> Self {
-        Self::with_secret(Some(TEST_JWT_SECRET)).await
+        Self(TestApp::start().await)
     }
 
     async fn with_secret(secret: Option<&str>) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let config = server::Config {
-            database_path: dir.path().join("test.db"),
-            storage: server::StorageConfig::Local {
-                dir: dir.path().join("recordings"),
-            },
-            cors_allowed_origins: vec!["http://localhost:8080".into()],
-            max_upload_bytes: 1024 * 1024,
-            storage_quota_bytes: 10 * 1024 * 1024,
-            web_dist_dir: None,
-            live_dir: dir.path().join("live"),
-            ffmpeg_path: "ffmpeg".into(),
-            max_live_broadcasts: 2,
-            live_idle_timeout: std::time::Duration::from_secs(20),
-            jwt_secret: secret.map(Into::into),
-            jwt_ttl: std::time::Duration::from_secs(3600),
-        };
-        let app = server::build_app(config).await.unwrap();
-        Self { _dir: dir, app }
+        Self(TestApp::with_config(|config| config.jwt_secret = secret.map(Into::into)).await)
     }
 
     async fn request(
@@ -65,29 +24,9 @@ impl AuthServer {
         method: &str,
         uri: &str,
         token: Option<&str>,
-        body: Option<Value>,
+        body: Option<serde_json::Value>,
     ) -> Reply {
-        let mut request = Request::builder().method(method).uri(uri);
-        if let Some(token) = token {
-            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
-        }
-        let request = match body {
-            Some(body) => request
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string())),
-            None => request.body(Body::empty()),
-        }
-        .unwrap();
-        let response = self.app.clone().oneshot(request).await.unwrap();
-        let status = response.status();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .to_vec();
-        Reply { status, body }
+        self.0.request(method, uri, token, body).await
     }
 
     async fn signup(&self, username: &str, password: &str) -> Reply {
