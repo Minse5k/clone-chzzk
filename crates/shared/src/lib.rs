@@ -251,3 +251,22 @@ pub fn comments_path(broadcast_id: Uuid) -> String {
 pub fn comment_path(broadcast_id: Uuid, comment_id: Uuid) -> String {
     format!("/api/broadcasts/{broadcast_id}/comments/{comment_id}")
 }
+
+/// 댓글 실시간 WebSocket 경로(읽기 전용, 로그인 불필요).
+///
+/// 연결해 두면 그 방송에 댓글이 생기거나 지워질 때마다 서버가 [`CommentEvent`]를 보낸다.
+/// 연결 전에 쓰인 댓글은 보내지 않으므로, 연결한 뒤 [`comments_path`]로 목록을 받아 채운다.
+/// 방송이 삭제되면 서버가 연결을 닫는다.
+pub fn comments_ws_path(broadcast_id: Uuid) -> String {
+    format!("/api/broadcasts/{broadcast_id}/comments/ws")
+}
+
+/// 댓글 실시간 WebSocket으로 서버가 보내는 텍스트 메시지.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CommentEvent {
+    /// 댓글이 생겼다.
+    Created { comment: Comment },
+    /// 댓글이 지워졌다.
+    Deleted { comment_id: Uuid },
+}

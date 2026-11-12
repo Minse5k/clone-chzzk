@@ -30,6 +30,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub live: Arc<live::LiveCapacity>,
     pub auth: Arc<auth::AuthKeys>,
+    pub comments: Arc<comments::CommentHub>,
 }
 
 /// 설정으로 DB와 저장소를 준비하고 HTTP 라우터를 만든다.
@@ -50,6 +51,7 @@ pub async fn build_app(config: Config) -> anyhow::Result<Router> {
         config: Arc::new(config),
         live: Arc::new(live),
         auth: Arc::new(auth),
+        comments: Arc::default(),
     };
     // 서버가 송출 도중에 멈췄다면 라이브 중으로 남은 방송을 정리한다.
     live::recover(&state).await?;

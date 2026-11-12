@@ -134,6 +134,7 @@ async fn delete_broadcast(
         DeleteOutcome::NotFound => return Err(broadcast_not_found()),
     };
     tracing::info!(broadcast = %id, "방송 삭제: {}", stored.broadcast.title);
+    state.comments.close(id);
     if let Some(location) = location {
         delete_recording_object(&state, &location).await;
     }

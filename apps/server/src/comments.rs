@@ -1,13 +1,20 @@
 //! 방송별 댓글. 목록은 누구나 보고, 작성은 로그인한 사용자, 삭제는 작성자만 한다.
 
+use std::{collections::HashMap, sync::Mutex};
+
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{
+        Path, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
     http::StatusCode,
+    response::Response,
     routing::{delete, get},
 };
 use chrono::Utc;
-use shared::{COMMENT_LIST_LIMIT, COMMENT_MAX_CHARS, Comment, NewComment};
+use shared::{COMMENT_LIST_LIMIT, COMMENT_MAX_CHARS, Comment, CommentEvent, NewComment};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{AppState, api::ApiError, auth::AuthUser, db};
@@ -18,6 +25,7 @@ pub fn router() -> Router<AppState> {
             "/api/broadcasts/{id}/comments",
             get(list_comments).post(create_comment),
         )
+        .route("/api/broadcasts/{id}/comments/ws", get(comment_feed))
         .route(
             "/api/broadcasts/{id}/comments/{comment_id}",
             delete(delete_comment),
@@ -53,6 +61,12 @@ async fn create_comment(
     if !db::insert_comment(&state.db, &comment).await? {
         return Err(broadcast_not_found());
     }
+    state.comments.publish(
+        broadcast_id,
+        CommentEvent::Created {
+            comment: comment.clone(),
+        },
+    );
     Ok((StatusCode::CREATED, Json(comment)))
 }
 
@@ -77,6 +91,12 @@ async fn delete_comment(
         ));
     }
     db::delete_comment(&state.db, comment.id).await?;
+    state.comments.publish(
+        broadcast_id,
+        CommentEvent::Deleted {
+            comment_id: comment.id,
+        },
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -108,4 +128,98 @@ fn validate_body(body: &str) -> Result<String, ApiError> {
         ));
     }
     Ok(body.to_owned())
+}
+
+/// 방송별 댓글 알림 채널. 댓글 WebSocket 연결마다 구독하고, 댓글 API가 처리를 마친 뒤 알린다.
+#[derive(Default)]
+pub struct CommentHub {
+    channels: Mutex<HashMap<Uuid, broadcast::Sender<CommentEvent>>>,
+}
+
+/// 구독자가 늦어 쌓아 둘 수 있는 알림 수. 넘치면 오래된 알림부터 건너뛴다.
+const CHANNEL_CAPACITY: usize = 64;
+
+impl CommentHub {
+    fn subscribe(&self, broadcast_id: Uuid) -> broadcast::Receiver<CommentEvent> {
+        self.lock()
+            .entry(broadcast_id)
+            .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
+            .subscribe()
+    }
+
+    /// 구독자에게 알린다. 구독자가 없으면 채널을 정리한다.
+    fn publish(&self, broadcast_id: Uuid, event: CommentEvent) {
+        let mut channels = self.lock();
+        if let Some(sender) = channels.get(&broadcast_id)
+            && sender.send(event).is_err()
+        {
+            channels.remove(&broadcast_id);
+        }
+    }
+
+    /// 구독이 끝났을 때 남은 구독자가 없으면 채널을 정리한다.
+    fn release(&self, broadcast_id: Uuid) {
+        let mut channels = self.lock();
+        if channels
+            .get(&broadcast_id)
+            .is_some_and(|sender| sender.receiver_count() == 0)
+        {
+            channels.remove(&broadcast_id);
+        }
+    }
+
+    /// 방송이 지워졌다. 채널을 없애 그 방송의 댓글 WebSocket 연결이 모두 닫히게 한다.
+    pub fn close(&self, broadcast_id: Uuid) {
+        self.lock().remove(&broadcast_id);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, broadcast::Sender<CommentEvent>>> {
+        self.channels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// 댓글 실시간 WebSocket. 읽기 전용이라 로그인하지 않아도 연결할 수 있다.
+async fn comment_feed(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let broadcast_id = existing_broadcast(&state, &id).await?;
+    // 연결을 받기 전에 구독해, 연결 직후에 쓰인 댓글도 놓치지 않게 한다.
+    let events = state.comments.subscribe(broadcast_id);
+    Ok(ws.on_upgrade(move |socket| async move {
+        relay_events(socket, events).await;
+        state.comments.release(broadcast_id);
+    }))
+}
+
+async fn relay_events(mut socket: WebSocket, mut events: broadcast::Receiver<CommentEvent>) {
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Ok(event) => {
+                    let text = serde_json::to_string(&event).expect("댓글 알림은 항상 JSON으로 바뀐다");
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        return;
+                    }
+                }
+                // 너무 늦은 구독자는 놓친 알림을 건너뛴다. 웹은 다시 연결할 때 목록을 새로 받는다.
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::debug!("댓글 알림 {skipped}개를 건너뜁니다");
+                }
+                // 방송이 지워졌다.
+                Err(broadcast::error::RecvError::Closed) => {
+                    let _ = socket.send(Message::Close(None)).await;
+                    return;
+                }
+            },
+            message = socket.recv() => match message {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return,
+                // 시청자가 보내는 메시지는 쓰지 않는다(Ping에는 axum이 알아서 답한다).
+                Some(Ok(_)) => {}
+            },
+        }
+    }
 }
