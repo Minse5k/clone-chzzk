@@ -3,8 +3,8 @@
 clone-chzzk를 Oracle Cloud(OCI)에 **Always Free 한도 안에서** 배포하는 순서다. 콘솔에서 직접 자원을 만들고, VM에서 Docker Compose로 앱을 띄운다.
 
 - 리전: **Japan Central (Osaka, `ap-osaka-1`)** — 홈 리전. Always Free 자원은 홈 리전에서만 무료다.
-- 구성: A1 VM 1대(앱 + Caddy) + 비공개 Object Storage 버킷(녹화본)
-- 접속: 지금은 공인 IP + HTTP. 도메인이 생기면 HTTPS를 붙인다(맨 아래).
+- 구성: A1 VM 1대(앱 + ffmpeg + Caddy) + 비공개 Object Storage 버킷(녹화본)
+- 접속: `https://<공인IP를 대시로>.sslip.io`. 휴대폰 브라우저는 HTTPS에서만 카메라·마이크를 허용하므로, 도메인 없이 sslip.io 주소에 Caddy가 Let's Encrypt 인증서를 자동으로 붙인다(무료).
 
 > ⚠️ **과금 위험 — 먼저 읽기**
 >
@@ -16,6 +16,8 @@ clone-chzzk를 Oracle Cloud(OCI)에 **Always Free 한도 안에서** 배포하�
 > | 블록 스토리지(부트 볼륨 포함) | 200GB | 50GB |
 > | Object Storage(Standard·IA·Archive 합계) | 20GB, API 요청 월 5만 건 | 앱이 15GiB에서 업로드를 막음 |
 > | 아웃바운드 데이터 전송 | 월 10TB | 시청 트래픽 |
+>
+> 라이브 송출은 방송마다 ffmpeg가 A1 CPU로 다시 인코딩한다(720p 기준 OCPU 1개 안팎). 2 OCPU VM에서는 `MAX_LIVE_BROADCASTS=2`(기본값)를 넘기지 않는다. CPU를 더 쓴다고 과금되지는 않지만, 넘치면 모든 방송이 끊긴다.
 >
 > 다른 VM·볼륨·버킷이 이미 있다면 그 사용량도 합산된다.
 
@@ -132,7 +134,11 @@ OCI_REGION=ap-osaka-1
 OCI_BUCKET=chzzk-recordings
 OCI_ACCESS_KEY_ID=<Access Key>
 OCI_SECRET_ACCESS_KEY=<Secret Key>
+# 휴대폰 송출용 HTTPS 주소. 공인 IP의 점(.)을 대시(-)로 바꾼다. 예: 공인 IP 158.101.1.2 → 158-101-1-2.sslip.io
+SITE_ADDRESS=<공인IP를 대시로>.sslip.io
 ```
+
+> sslip.io는 `158-101-1-2.sslip.io` 같은 이름을 그 IP로 돌려주는 무료 DNS다. 가입이나 설정이 없다. Caddy는 이 이름으로 Let's Encrypt 인증서를 받으므로 80·443 포트가 열려 있어야 한다(1·5단계).
 
 > `DATABASE_PATH`, `STORAGE_DIR`, `SERVER_ADDR`, `WEB_DIST_DIR`는 `compose.yaml`이 컨테이너 경로로 고정하므로 `.env`의 값은 쓰이지 않는다. `API_BASE_URL`, `CORS_ALLOWED_ORIGINS`도 같은 출처로 서빙되는 배포에서는 쓰이지 않는다.
 
@@ -143,17 +149,27 @@ docker compose up -d --build
 docker compose logs -f app
 ```
 
-로그에 `서버 시작: http://0.0.0.0:3000`이 나오면 준비된 것이다. OCI 설정이 틀리면 원인을 출력하고 컨테이너가 재시작을 반복하므로, 로그를 보고 `.env`를 고친 뒤 `docker compose up -d`로 다시 띄운다.
+로그에 `서버 시작: http://0.0.0.0:3000`이 나오면 준비된 것이다. `ffmpeg(...)를 실행할 수 없어` 경고가 없어야 라이브 송출을 받는다(이미지에 ffmpeg가 들어 있다). OCI 설정이 틀리면 원인을 출력하고 컨테이너가 재시작을 반복하므로, 로그를 보고 `.env`를 고친 뒤 `docker compose up -d`로 다시 띄운다.
 
 ## 7. 직접 확인
 
-브라우저에서 `http://<공인 IP>`를 연다.
+브라우저에서 `https://<공인IP를 대시로>.sslip.io`를 연다. 주소창에 자물쇠가 보이면 인증서가 붙은 것이다. 처음 접속할 때 인증서 발급으로 몇 초 걸릴 수 있다(`docker compose logs caddy`에서 `certificate obtained successfully` 확인).
+
+녹화방송(과제 1)
 
 1. **방송 등록**에서 제목과 mp4/webm 파일을 올린다 → 상세 화면으로 이동하고 재생된다.
 2. 재생 바를 움직여 원하는 지점으로 건너뛸 수 있다.
 3. 상세 화면의 **공유 URL 복사**를 눌러 다른 기기·시크릿 창에서 연다 → 같은 방송이 열린다.
 4. OCI 콘솔의 버킷 → Objects에 `recordings/<방송 ID>.mp4`가 생겼는지 확인한다.
 5. `docker compose restart app` 후 목록과 재생이 그대로인지 확인한다.
+
+휴대폰 라이브 송출(과제 2)
+
+1. 휴대폰 브라우저(안드로이드 Chrome, iOS Safari)로 같은 `https://…sslip.io` 주소를 열고 **라이브 송출**을 누른다.
+2. **카메라·마이크 켜기** → 권한을 허용하면 미리보기가 나온다. 제목을 넣고 **방송 시작**.
+3. PC 브라우저에서 방송 목록을 열면 **라이브 중**에 방송이 보인다. 눌러서 3~6초 지연으로 시청한다.
+4. 휴대폰에서 **방송 종료** → PC 화면이 `종료`로 바뀌고, 잠시 뒤 녹화본으로 다시 볼 수 있다.
+5. OCI 버킷에 그 방송의 `recordings/<방송 ID>.mp4`가 생겼는지 확인한다.
 
 ## 다시 배포하기
 
@@ -169,9 +185,9 @@ DB(SQLite)는 `app-data` 볼륨에 있어 재배포해도 유지된다. 백업�
 docker compose cp app:/data/chzzk.db ./chzzk-backup.db
 ```
 
-## 도메인과 HTTPS (나중에)
+## 자기 도메인 쓰기 (선택)
 
-도메인의 A 레코드를 VM 공인 IP로 맞춘 뒤, `.env`에 다음을 추가하고 다시 띄우면 Caddy가 인증서를 자동으로 발급한다.
+sslip.io 대신 자기 도메인을 쓰려면 도메인의 A 레코드를 VM 공인 IP로 맞춘 뒤, `.env`의 `SITE_ADDRESS`를 바꾸고 다시 띄운다. Caddy가 새 인증서를 자동으로 발급한다.
 
 ```dotenv
 SITE_ADDRESS=example.com

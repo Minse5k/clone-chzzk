@@ -13,6 +13,8 @@ services:
       WEB_DIST_DIR: /app/web
       DATABASE_PATH: /data/chzzk.db
       STORAGE_DIR: /data/recordings
+      LIVE_DIR: /data/live
+      FFMPEG_PATH: ffmpeg
     volumes:
       - app-data:/data
     expose:
@@ -27,7 +29,9 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      # 지금은 공인 IP + HTTP(:80). 도메인이 생기면 SITE_ADDRESS=example.com 으로 두면 HTTPS 인증서가 자동으로 붙는다.
+      # 기본은 HTTP(:80). 휴대폰 송출에는 HTTPS가 필요하므로 배포에서는
+      # SITE_ADDRESS=<공인IP를 대시로>.sslip.io (예: 158-101-1-2.sslip.io) 또는 자기 도메인을 두면
+      # Caddy가 Let's Encrypt 인증서를 자동으로 발급한다.
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
@@ -35,6 +39,6 @@ services:
       - caddy-config:/config
 
 volumes:
-  app-data: # SQLite 파일과 local 저장소 녹화본
+  app-data: # SQLite 파일, local 저장소 녹화본, 라이브 HLS 조각
   caddy-data:
   caddy-config:
