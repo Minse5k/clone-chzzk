@@ -97,6 +97,7 @@ impl TryFrom<BroadcastRow> for StoredBroadcast {
                 status: BroadcastStatus::from_ended_at(ended_at),
                 ended_at,
                 recording,
+                live_playlist: false,
             },
             recording_location,
         })
@@ -207,5 +208,35 @@ pub async fn insert_broadcast(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// 송출을 시작한 라이브 방송을 기록한다. 종료 시각이 없으므로 라이브 중이다.
+pub async fn insert_live_broadcast(
+    pool: &SqlitePool,
+    id: Uuid,
+    title: &str,
+    started_at: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO broadcasts (id, title, created_at) VALUES (?, ?, ?)")
+        .bind(id.to_string())
+        .bind(title)
+        .bind(format_time(started_at))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 라이브 방송을 종료한다. 이미 종료된 방송이면 그대로 둔다.
+pub async fn end_broadcast(
+    pool: &SqlitePool,
+    id: Uuid,
+    ended_at: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    sqlx::query("UPDATE broadcasts SET ended_at = ? WHERE id = ? AND ended_at IS NULL")
+        .bind(format_time(ended_at))
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
     Ok(())
 }

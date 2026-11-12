@@ -17,6 +17,10 @@ pub struct Config {
     pub storage_quota_bytes: u64,
     /// 빌드된 웹 정적 파일 디렉터리. 지정하면 서버가 웹 화면도 함께 서빙한다(배포 시).
     pub web_dist_dir: Option<PathBuf>,
+    /// 라이브 방송의 HLS 조각을 만드는 디렉터리. 방송마다 하위 디렉터리를 쓴다.
+    pub live_dir: PathBuf,
+    /// 송출을 HLS로 바꾸는 ffmpeg 실행 파일.
+    pub ffmpeg_path: PathBuf,
 }
 
 /// 녹화본 저장소 백엔드. `STORAGE_BACKEND`로 고른다(기본 `local`).
@@ -107,6 +111,8 @@ impl Config {
                 .ok()
                 .filter(|dir| !dir.trim().is_empty())
                 .map(PathBuf::from),
+            live_dir: env_or("LIVE_DIR", "data/live").into(),
+            ffmpeg_path: env_or("FFMPEG_PATH", "ffmpeg").into(),
         })
     }
 }

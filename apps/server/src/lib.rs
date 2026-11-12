@@ -3,6 +3,7 @@
 mod api;
 mod config;
 mod db;
+mod live;
 mod range;
 mod storage;
 

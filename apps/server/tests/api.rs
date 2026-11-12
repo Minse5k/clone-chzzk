@@ -98,6 +98,8 @@ impl TestServer {
             max_upload_bytes: limits.max_upload_bytes,
             storage_quota_bytes: limits.storage_quota_bytes,
             web_dist_dir: None,
+            live_dir: dir.path().join("live"),
+            ffmpeg_path: "ffmpeg".into(),
         }
     }
 

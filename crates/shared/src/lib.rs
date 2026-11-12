@@ -16,6 +16,9 @@ pub struct Broadcast {
     pub ended_at: Option<DateTime<Utc>>,
     /// 종료된 방송에 남는 영상. 아직 녹화본이 없는 방송이면 `None`.
     pub recording: Option<Recording>,
+    /// 라이브 재생 목록(HLS)이 있어 지금 볼 수 있는지. 송출 직후 첫 조각이 만들어지기 전에는 `false`.
+    #[serde(default)]
+    pub live_playlist: bool,
 }
 
 /// 방송이 지금 송출 중인지 여부. `Live`에서 `Ended`로만 바뀐다.
@@ -117,4 +120,46 @@ pub const UPLOAD_POLICY_PATH: &str = "/api/upload-policy";
 /// 녹화본 재생 API 경로. Range 요청을 지원한다.
 pub fn recording_path(id: Uuid) -> String {
     format!("/api/broadcasts/{id}/recording")
+}
+
+/// 라이브 재생 목록(HLS) 경로. 같은 디렉터리의 조각 파일은 재생 목록 기준 상대 경로로 받는다.
+pub fn live_playlist_path(id: Uuid) -> String {
+    format!("/api/broadcasts/{id}/live/{LIVE_PLAYLIST_FILE}")
+}
+
+/// 라이브 재생 목록 파일 이름.
+pub const LIVE_PLAYLIST_FILE: &str = "index.m3u8";
+
+/// 송출 WebSocket 경로.
+///
+/// 송출자가 연결을 열고 [`IngestClientMessage::Start`]를 보내면 서버가 라이브 방송을 만들고
+/// [`IngestServerMessage::Started`]로 답한다. 이후 바이너리 메시지는 모두 브라우저
+/// MediaRecorder가 만든 녹화 조각이다. [`IngestClientMessage::End`]를 보내거나 연결이 끊기면
+/// 방송이 종료된다. 연결의 수명이 곧 라이브 방송의 수명이다.
+pub const LIVE_INGEST_PATH: &str = "/api/live/ingest";
+
+/// 송출자가 보내는 텍스트 메시지.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IngestClientMessage {
+    /// 송출 시작. 연결 후 첫 메시지여야 한다.
+    Start {
+        title: String,
+        /// MediaRecorder 녹화 형식. 예: `video/webm;codecs=vp8,opus`, `video/mp4`.
+        mime_type: String,
+    },
+    /// 송출 종료. 마지막 녹화 조각을 보낸 뒤에 보낸다.
+    End,
+}
+
+/// 서버가 송출자에게 보내는 텍스트 메시지.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IngestServerMessage {
+    /// 라이브 방송이 만들어졌다. 이제 녹화 조각을 보내면 된다.
+    Started { broadcast: Broadcast },
+    /// 방송이 종료되었다. 서버가 먼저 끝낸 경우 `reason`에 이유가 있다.
+    Ended { reason: Option<String> },
+    /// 송출을 시작할 수 없다. 방송은 만들어지지 않았다.
+    Error { message: String },
 }
