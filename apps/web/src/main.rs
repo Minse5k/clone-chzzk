@@ -355,6 +355,9 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
         }
     });
 
+    // 아래에서 방송 값이 같은 이름을 가리므로, 관리 후 다시 불러올 때 쓸 핸들을 따로 둔다.
+    let mut reload = broadcast;
+
     match &*broadcast.read() {
         None => rsx! { p { class: "notice", "불러오는 중…" } },
         Some(Err(message)) => rsx! { p { class: "notice error", "{message}" } },
@@ -402,9 +405,135 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
                     }
                 }
                 ShareUrl { id: broadcast.id.to_string() }
+                OwnerControls {
+                    broadcast: broadcast.clone(),
+                    on_changed: move |_| reload.restart(),
+                }
             }
         },
     }
+}
+
+/// 소유자에게만 보이는 방송 관리(제목 수정, 라이브 종료, 삭제).
+/// 버튼은 소유자에게만 보이지만, 권한은 서버가 다시 확인하고 거절하면 그 이유를 보여 준다.
+#[component]
+fn OwnerControls(broadcast: Broadcast, on_changed: EventHandler<()>) -> Element {
+    let mut editing = use_signal(|| false);
+    let mut new_title = use_signal(String::new);
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| None::<String>);
+    let navigator = use_navigator();
+
+    let is_owner = session::current_user().is_some_and(|user| user.id == broadcast.owner.id);
+    if !is_owner {
+        return rsx! {};
+    }
+    let id = broadcast.id;
+    let live = broadcast.status == BroadcastStatus::Live;
+    let current_title = broadcast.title.clone();
+
+    let save_title = move |event: FormEvent| async move {
+        event.prevent_default();
+        busy.set(true);
+        match api::update_broadcast(id, &new_title()).await {
+            Ok(_) => {
+                editing.set(false);
+                error.set(None);
+                on_changed.call(());
+            }
+            Err(message) => error.set(Some(message)),
+        }
+        busy.set(false);
+    };
+
+    let end_live = move |_| async move {
+        if !confirm("라이브 방송을 종료할까요? 송출 중인 기기의 송출도 끝납니다.")
+        {
+            return;
+        }
+        busy.set(true);
+        match api::end_broadcast(id).await {
+            Ok(_) => {
+                error.set(None);
+                on_changed.call(());
+            }
+            Err(message) => error.set(Some(message)),
+        }
+        busy.set(false);
+    };
+
+    let delete = move |_| async move {
+        if !confirm("방송을 삭제할까요? 녹화본과 댓글도 함께 지워지며 되돌릴 수 없습니다.")
+        {
+            return;
+        }
+        busy.set(true);
+        match api::delete_broadcast(id).await {
+            Ok(()) => {
+                navigator.replace(Route::BroadcastList {});
+            }
+            Err(message) => {
+                error.set(Some(message));
+                busy.set(false);
+            }
+        }
+    };
+
+    rsx! {
+        section { class: "owner-controls",
+            h2 { "방송 관리" }
+            if editing() {
+                form { class: "title-edit", onsubmit: save_title,
+                    input {
+                        r#type: "text",
+                        "aria-label": "새 제목",
+                        maxlength: TITLE_MAX_CHARS as i64,
+                        value: "{new_title}",
+                        disabled: busy(),
+                        oninput: move |event| new_title.set(event.value()),
+                    }
+                    button { r#type: "submit", disabled: busy(), "저장" }
+                    button {
+                        r#type: "button",
+                        class: "secondary",
+                        disabled: busy(),
+                        onclick: move |_| {
+                            editing.set(false);
+                            error.set(None);
+                        },
+                        "취소"
+                    }
+                }
+            } else {
+                div { class: "button-row",
+                    button {
+                        class: "secondary",
+                        disabled: busy(),
+                        onclick: move |_| {
+                            new_title.set(current_title.clone());
+                            editing.set(true);
+                        },
+                        "제목 수정"
+                    }
+                    if live {
+                        button { class: "danger", disabled: busy(), onclick: end_live, "라이브 종료" }
+                    } else {
+                        button { class: "danger", disabled: busy(), onclick: delete, "방송 삭제" }
+                    }
+                }
+            }
+            if let Some(message) = error() {
+                p { class: "notice error", role: "alert", "{message}" }
+            }
+        }
+    }
+}
+
+/// 브라우저 확인 창. 열 수 없으면 진행하지 않는다.
+fn confirm(message: &str) -> bool {
+    web_sys::window()
+        .and_then(|window| window.confirm_with_message(message).ok())
+        .unwrap_or(false)
 }
 
 /// 다시 불러오면 바뀔 수 있는 방송: 라이브 중이거나, 끝났지만 녹화본을 아직 만드는 중이다.

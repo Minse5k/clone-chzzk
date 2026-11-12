@@ -6,7 +6,7 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State, multipart::MultipartError},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -14,14 +14,14 @@ use serde::Deserialize;
 use serde_json::json;
 use shared::{
     Broadcast, BroadcastStatus, LIVE_INGEST_PATH, Recording, TITLE_MAX_CHARS, UPLOAD_POLICY_PATH,
-    UploadPolicy, format_bytes, registration_fields,
+    UpdateBroadcast, UploadPolicy, format_bytes, registration_fields,
 };
 use uuid::Uuid;
 
 use crate::{
     AppState,
     auth::{self, AuthUser},
-    db::{self, InsertError, NewBroadcast, RecordingLocation},
+    db::{self, DeleteOutcome, InsertError, NewBroadcast, RecordingLocation},
     live,
     range::{self, RangeRequest},
     storage::ByteRange,
@@ -37,7 +37,13 @@ pub fn router() -> Router<AppState> {
                 .layer(DefaultBodyLimit::disable()),
         )
         .route(UPLOAD_POLICY_PATH, get(upload_policy))
-        .route("/api/broadcasts/{id}", get(get_broadcast))
+        .route(
+            "/api/broadcasts/{id}",
+            get(get_broadcast)
+                .patch(update_broadcast)
+                .delete(delete_broadcast),
+        )
+        .route("/api/broadcasts/{id}/end", post(end_broadcast))
         .route("/api/broadcasts/{id}/recording", get(play_recording))
         .route("/api/broadcasts/{id}/live/{file}", get(live::serve_file))
         .route(LIVE_INGEST_PATH, any(live::ingest))
@@ -91,6 +97,97 @@ async fn get_broadcast(
     Path(id): Path<String>,
 ) -> Result<Json<Broadcast>, ApiError> {
     let mut broadcast = find(&state, &id).await?.broadcast;
+    broadcast.live_playlist = live::has_playlist(&state, broadcast.id).await;
+    Ok(Json(broadcast))
+}
+
+/// 방송 제목 수정. 소유자만 할 수 있다. 라이브 중에도 바꿀 수 있다.
+async fn update_broadcast(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    Json(update): Json<UpdateBroadcast>,
+) -> Result<Json<Broadcast>, ApiError> {
+    let stored = find_owned(&state, &id, &auth).await?;
+    let title = validate_title(&update.title)?;
+    db::update_title(&state.db, stored.broadcast.id, &title).await?;
+    let mut broadcast = stored.broadcast;
+    broadcast.title = title;
+    broadcast.live_playlist = live::has_playlist(&state, broadcast.id).await;
+    Ok(Json(broadcast))
+}
+
+/// 방송 삭제. 소유자만 할 수 있고, 라이브 중인 방송은 먼저 종료해야 한다.
+/// 녹화본과 댓글도 함께 지워 저장 공간을 돌려받는다.
+async fn delete_broadcast(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let stored = find_owned(&state, &id, &auth).await?;
+    let id = stored.broadcast.id;
+    let location = match db::delete_broadcast(&state.db, id).await? {
+        DeleteOutcome::Deleted(location) => location,
+        DeleteOutcome::Live => return Err(still_live()),
+        DeleteOutcome::NotFound => return Err(broadcast_not_found()),
+    };
+    tracing::info!(broadcast = %id, "방송 삭제: {}", stored.broadcast.title);
+    if let Some(location) = location {
+        delete_recording_object(&state, &location).await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 지운 방송의 녹화본 객체를 저장소에서 지운다. 지금 지울 수 없으면 삭제 대기열에 넣어
+/// 서버가 다음에 시작할 때 다시 지운다. DB에서는 이미 지워졌으므로 저장 총량은 바로 돌아온다.
+async fn delete_recording_object(state: &AppState, location: &RecordingLocation) {
+    let deleted = if location.storage_backend == state.store.backend_name() {
+        match state.store.delete(&location.object_key).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    "녹화본 {}을 지우지 못했습니다: {err:#}",
+                    location.object_key
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if !deleted && let Err(err) = db::enqueue_deletion(&state.db, location).await {
+        tracing::error!(
+            "녹화본 {}을 삭제 대기열에 넣지 못했습니다: {err:#}",
+            location.object_key
+        );
+    }
+}
+
+/// 라이브 종료. 소유자만 할 수 있다. 송출하던 기기가 아닌 곳에서도 방송을 끝낼 수 있다.
+/// 송출 연결에는 종료를 알리고, 송출 연결은 평소처럼 녹화본을 만든다.
+async fn end_broadcast(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Json<Broadcast>, ApiError> {
+    let stored = find_owned(&state, &id, &auth).await?;
+    let mut broadcast = stored.broadcast;
+    if broadcast.status == BroadcastStatus::Ended {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "이미 종료된 방송입니다.",
+        ));
+    }
+    // 상태를 먼저 종료로 바꿔 응답에 바로 반영한다. 송출 연결이 기록할 때는 이미 종료라 그대로 둔다.
+    let ended_at = Utc::now();
+    db::end_broadcast(&state.db, broadcast.id, ended_at).await?;
+    if !state.live.request_stop(broadcast.id) {
+        // 송출 연결이 막 끝나는 중이었다. 그 연결이 녹화본을 마무리한다.
+        tracing::info!(broadcast = %broadcast.id, "종료할 송출 연결이 이미 없습니다");
+    }
+    tracing::info!(broadcast = %broadcast.id, "소유자가 라이브 방송을 종료했습니다");
+    broadcast.status = BroadcastStatus::Ended;
+    broadcast.ended_at = Some(ended_at);
     broadcast.live_playlist = live::has_playlist(&state, broadcast.id).await;
     Ok(Json(broadcast))
 }
@@ -401,11 +498,40 @@ fn header_value(value: &str) -> Result<HeaderValue, ApiError> {
 
 /// 방송을 찾는다. ID 형식이 틀려도 없는 방송과 똑같이 404로 답한다.
 async fn find(state: &AppState, id: &str) -> Result<db::StoredBroadcast, ApiError> {
-    let not_found = || ApiError::not_found("방송을 찾을 수 없습니다.");
-    let id = Uuid::parse_str(id).map_err(|_| not_found())?;
+    let id = Uuid::parse_str(id).map_err(|_| broadcast_not_found())?;
     db::find_broadcast(&state.db, id)
         .await?
-        .ok_or_else(not_found)
+        .ok_or_else(broadcast_not_found)
+}
+
+/// 방송 관리 권한 확인. 로그인한 사용자가 그 방송의 소유자인지 서버가 직접 확인한다.
+///
+/// 판정 순서: 로그인하지 않았으면 401(인자로 받는 [`AuthUser`]가 먼저 거절한다),
+/// 없는 방송이면 404, 소유자가 아니면 403.
+pub(crate) async fn find_owned(
+    state: &AppState,
+    id: &str,
+    auth: &AuthUser,
+) -> Result<db::StoredBroadcast, ApiError> {
+    let stored = find(state, id).await?;
+    if stored.broadcast.owner.id != auth.user.id {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "이 방송의 소유자만 할 수 있습니다.",
+        ));
+    }
+    Ok(stored)
+}
+
+fn broadcast_not_found() -> ApiError {
+    ApiError::not_found("방송을 찾을 수 없습니다.")
+}
+
+fn still_live() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "라이브 중인 방송은 먼저 종료해야 삭제할 수 있습니다.",
+    )
 }
 
 /// API 오류. 본문에 사용자에게 보여 줄 한국어 메시지를 담는다.

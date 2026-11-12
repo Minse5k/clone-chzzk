@@ -13,8 +13,8 @@ use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
 use shared::{
     AuthResponse, Broadcast, BroadcastStatus, IngestClientMessage, IngestServerMessage,
-    LIVE_INGEST_PATH, SIGNUP_PATH, UPLOAD_POLICY_PATH, UploadPolicy, broadcast_path,
-    broadcasts_path, live_playlist_path, recording_path,
+    LIVE_INGEST_PATH, SIGNUP_PATH, UPLOAD_POLICY_PATH, UploadPolicy, broadcast_end_path,
+    broadcast_path, broadcasts_path, live_playlist_path, recording_path,
 };
 use tempfile::TempDir;
 
@@ -110,6 +110,15 @@ impl LiveServer {
             content_type,
             body: body.to_vec(),
         }
+    }
+
+    /// 주어진 토큰으로 본문 없는 POST 요청을 보내고 상태 코드를 돌려준다.
+    async fn post_as(&self, uri: &str, token: &str) -> StatusCode {
+        let request = Request::post(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        self.app.clone().oneshot(request).await.unwrap().status()
     }
 
     async fn get_json<T: DeserializeOwned>(&self, uri: &str) -> T {
@@ -684,4 +693,46 @@ async fn 송출한_사용자가_라이브_방송의_소유자가_된다() {
     );
     send(&mut socket, &IngestClientMessage::End).await;
     receive(&mut socket).await;
+}
+
+#[tokio::test]
+async fn 소유자가_다른_기기에서_라이브를_종료하면_송출이_이유와_함께_끝나고_녹화본이_남는다() {
+    let server = LiveServer::start().await;
+    let other = signup(&server.app, "other_user").await;
+    let (mut socket, started) = server.start_broadcast("다른 기기에서 끌 방송").await;
+    send_video(&mut socket, &sample_webm(3)).await;
+    server
+        .wait_for(started.id, "라이브 재생 가능", |b| b.live_playlist)
+        .await;
+
+    // 다른 사용자는 끌 수 없고 송출은 그대로 이어진다.
+    let end_path = broadcast_end_path(started.id);
+    assert_eq!(
+        server.post_as(&end_path, &other.token).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        server.broadcast(started.id).await.status,
+        BroadcastStatus::Live
+    );
+
+    assert_eq!(
+        server.post_as(&end_path, &server.owner.token).await,
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        receive(&mut socket).await,
+        IngestServerMessage::Ended {
+            reason: Some("소유자가 다른 기기에서 방송을 종료했습니다.".into())
+        }
+    );
+    let ended = server
+        .wait_for(started.id, "녹화본 있음", |b| b.recording.is_some())
+        .await;
+    assert_eq!(ended.status, BroadcastStatus::Ended);
+    // 송출 자리도 돌아와 바로 다시 송출할 수 있다.
+    let (mut next, _) = server.start_broadcast("다음 방송").await;
+    send(&mut next, &IngestClientMessage::End).await;
+    receive(&mut next).await;
 }

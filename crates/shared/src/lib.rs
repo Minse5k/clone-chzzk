@@ -116,6 +116,17 @@ pub fn broadcast_path(id: Uuid) -> String {
     format!("/api/broadcasts/{id}")
 }
 
+/// 라이브 종료 API 경로. 소유자가 송출하던 기기가 아닌 곳에서도 라이브 방송을 끝낼 수 있다.
+pub fn broadcast_end_path(id: Uuid) -> String {
+    format!("/api/broadcasts/{id}/end")
+}
+
+/// 방송 수정 요청. 소유자만 할 수 있다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpdateBroadcast {
+    pub title: String,
+}
+
 /// 업로드 한도 API 경로.
 pub const UPLOAD_POLICY_PATH: &str = "/api/upload-policy";
 

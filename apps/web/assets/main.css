@@ -236,3 +236,24 @@ a.hint { color: var(--accent); }
 
 .login-required { display: flex; flex-direction: column; gap: 4px; }
 .meta .owner { font-weight: 700; color: var(--text); }
+
+.owner-controls {
+    margin-top: 24px;
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+.owner-controls h2 { margin-bottom: 4px; }
+
+.title-edit { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+
+.title-edit input {
+    flex: 1 1 220px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+}

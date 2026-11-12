@@ -9,7 +9,7 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use shared::{
     AuthResponse, Broadcast, BroadcastStatus, SIGNUP_PATH, UPLOAD_POLICY_PATH, UploadPolicy, User,
-    broadcasts_path, recording_path,
+    broadcast_end_path, broadcasts_path, recording_path,
 };
 use tempfile::TempDir;
 
@@ -173,6 +173,27 @@ impl TestServer {
     async fn get(&self, uri: &str) -> TestResponse {
         self.send(Request::get(uri).body(Body::empty()).unwrap())
             .await
+    }
+
+    /// 주어진 토큰으로(없으면 비로그인으로) JSON 요청을 보낸다.
+    async fn request_as(
+        &self,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> TestResponse {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let request = match body {
+            Some(body) => request
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string())),
+            None => request.body(Body::empty()),
+        };
+        self.send(request.unwrap()).await
     }
 
     async fn get_range(&self, uri: &str, range: &str) -> TestResponse {
@@ -861,4 +882,181 @@ async fn 등록한_사용자가_방송의_소유자가_된다() {
         .await
         .json();
     assert_eq!(detail.owner.username, "owner");
+}
+
+/// 방송 관리 요청을 비로그인, 다른 사용자, 소유자 순으로 보내며 거절과 허용을 확인한다.
+/// 소유자 요청의 응답을 돌려준다.
+async fn assert_only_owner_allowed(
+    server: &TestServer,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> TestResponse {
+    let other = server.signup("other_user").await;
+
+    let anonymous = server.request_as(method, uri, None, body.clone()).await;
+    assert_eq!(
+        anonymous.status,
+        StatusCode::UNAUTHORIZED,
+        "비로그인 {method} {uri}"
+    );
+    assert_eq!(anonymous.error_message(), "로그인이 필요합니다.");
+
+    let forbidden = server
+        .request_as(method, uri, Some(&other.token), body.clone())
+        .await;
+    assert_eq!(
+        forbidden.status,
+        StatusCode::FORBIDDEN,
+        "다른 사용자 {method} {uri}"
+    );
+    assert_eq!(
+        forbidden.error_message(),
+        "이 방송의 소유자만 할 수 있습니다."
+    );
+
+    let token = server.owner.token.clone();
+    server.request_as(method, uri, Some(&token), body).await
+}
+
+#[tokio::test]
+async fn 소유자만_방송_제목을_바꿀_수_있다() {
+    let server = TestServer::start().await;
+    let created = server.register("원래 제목", &sample_video(10)).await;
+    let uri = format!("/api/broadcasts/{}", created.id);
+
+    let response = assert_only_owner_allowed(
+        &server,
+        "PATCH",
+        &uri,
+        Some(serde_json::json!({ "title": "  바뀐 제목  " })),
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json::<Broadcast>().title, "바뀐 제목");
+    let detail: Broadcast = server.get(&uri).await.json();
+    assert_eq!(detail.title, "바뀐 제목");
+    assert_eq!(detail.recording, created.recording);
+}
+
+#[tokio::test]
+async fn 바꿀_제목도_등록과_같은_규칙을_따른다() {
+    let server = TestServer::start().await;
+    let created = server.register("원래 제목", &sample_video(10)).await;
+    let uri = format!("/api/broadcasts/{}", created.id);
+    let token = server.owner.token.clone();
+
+    for (title, message) in [
+        ("   ".to_owned(), "제목을 입력해 주세요."),
+        ("가".repeat(101), "제목은 100자 이하로 입력해 주세요."),
+    ] {
+        let response = server
+            .request_as(
+                "PATCH",
+                &uri,
+                Some(&token),
+                Some(serde_json::json!({ "title": title })),
+            )
+            .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(response.error_message(), message);
+    }
+    let detail: Broadcast = server.get(&uri).await.json();
+    assert_eq!(detail.title, "원래 제목");
+}
+
+#[tokio::test]
+async fn 소유자만_방송을_삭제할_수_있고_녹화본과_저장_공간도_돌아온다() {
+    let server = TestServer::start().await;
+    let created = server.register("지울 방송", &sample_video(1000)).await;
+    let uri = format!("/api/broadcasts/{}", created.id);
+    let before: UploadPolicy = server.get(UPLOAD_POLICY_PATH).await.json();
+
+    let response = assert_only_owner_allowed(&server, "DELETE", &uri, None).await;
+
+    assert_eq!(response.status, StatusCode::NO_CONTENT);
+    assert_eq!(server.get(&uri).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        server.get(&recording_path(created.id)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(server.list_broadcasts().await, vec![]);
+    assert_eq!(server.stored_file_count(), 0);
+    let after: UploadPolicy = server.get(UPLOAD_POLICY_PATH).await.json();
+    assert_eq!(after.remaining_bytes, before.remaining_bytes + 1000);
+}
+
+#[tokio::test]
+async fn 라이브_중인_방송은_삭제할_수_없다() {
+    let server = TestServer::start().await;
+    let id = server.insert_live_broadcast("라이브 방송").await;
+    let token = server.owner.token.clone();
+
+    let response = server
+        .request_as(
+            "DELETE",
+            &format!("/api/broadcasts/{id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(
+        response.error_message(),
+        "라이브 중인 방송은 먼저 종료해야 삭제할 수 있습니다."
+    );
+    assert_eq!(server.list_by_status(BroadcastStatus::Live).await.len(), 1);
+}
+
+#[tokio::test]
+async fn 소유자만_라이브_방송을_종료할_수_있다() {
+    let server = TestServer::start().await;
+    let id = server.insert_live_broadcast("라이브 방송").await;
+
+    let response = assert_only_owner_allowed(&server, "POST", &broadcast_end_path(id), None).await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    let ended: Broadcast = response.json();
+    assert_eq!(ended.status, BroadcastStatus::Ended);
+    let detail: Broadcast = server.get(&format!("/api/broadcasts/{id}")).await.json();
+    assert_eq!(detail.status, BroadcastStatus::Ended);
+    assert_eq!(detail.ended_at, ended.ended_at);
+}
+
+#[tokio::test]
+async fn 이미_종료된_방송을_다시_종료하면_409다() {
+    let server = TestServer::start().await;
+    let created = server.register("끝난 방송", &sample_video(10)).await;
+    let token = server.owner.token.clone();
+
+    let response = server
+        .request_as("POST", &broadcast_end_path(created.id), Some(&token), None)
+        .await;
+
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(response.error_message(), "이미 종료된 방송입니다.");
+}
+
+#[tokio::test]
+async fn 없는_방송을_관리하려_하면_404고_로그인하지_않았으면_먼저_401이다() {
+    let server = TestServer::start().await;
+    let token = server.owner.token.clone();
+    let missing = uuid::Uuid::now_v7();
+
+    for (method, uri) in [
+        ("PATCH", format!("/api/broadcasts/{missing}")),
+        ("DELETE", format!("/api/broadcasts/{missing}")),
+        ("POST", broadcast_end_path(missing)),
+        ("DELETE", "/api/broadcasts/not-a-uuid".to_owned()),
+    ] {
+        let body = (method == "PATCH").then(|| serde_json::json!({ "title": "제목" }));
+        let found = server
+            .request_as(method, &uri, Some(&token), body.clone())
+            .await;
+        assert_eq!(found.status, StatusCode::NOT_FOUND, "{method} {uri}");
+        let anonymous = server.request_as(method, &uri, None, body).await;
+        assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+    }
 }

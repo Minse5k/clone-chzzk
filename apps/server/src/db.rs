@@ -373,6 +373,73 @@ pub async fn is_token_revoked(pool: &SqlitePool, jti: &str) -> anyhow::Result<bo
     Ok(found.is_some())
 }
 
+/// 방송 제목을 바꾼다.
+pub async fn update_title(pool: &SqlitePool, id: Uuid, title: &str) -> anyhow::Result<()> {
+    sqlx::query("UPDATE broadcasts SET title = ? WHERE id = ?")
+        .bind(title)
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 방송 삭제 결과.
+pub enum DeleteOutcome {
+    /// 지웠다. 녹화본이 있었다면 저장소에서 지워야 할 위치를 돌려준다.
+    Deleted(Option<RecordingLocation>),
+    /// 라이브 중이라 지우지 않았다.
+    Live,
+    NotFound,
+}
+
+/// 종료된 방송과 그 녹화본·댓글 행을 한 트랜잭션에서 지운다. 라이브 중인 방송은 지우지 않는다.
+pub async fn delete_broadcast(pool: &SqlitePool, id: Uuid) -> anyhow::Result<DeleteOutcome> {
+    let id = id.to_string();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let ended_at: Option<Option<String>> =
+        sqlx::query_scalar("SELECT ended_at FROM broadcasts WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match ended_at {
+        None => return Ok(DeleteOutcome::NotFound),
+        Some(None) => return Ok(DeleteOutcome::Live),
+        Some(Some(_)) => {}
+    }
+    let location: Option<(String, String)> = sqlx::query_as(
+        "DELETE FROM recordings WHERE broadcast_id = ? RETURNING storage_backend, object_key",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM broadcasts WHERE id = ?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(DeleteOutcome::Deleted(location.map(
+        |(storage_backend, object_key)| RecordingLocation {
+            storage_backend,
+            object_key,
+        },
+    )))
+}
+
+/// 녹화본 객체를 삭제 대기열에 넣는다. 저장소에서 바로 지우지 못했을 때 쓴다.
+pub async fn enqueue_deletion(
+    pool: &SqlitePool,
+    location: &RecordingLocation,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO pending_object_deletions (storage_backend, object_key) VALUES (?, ?)",
+    )
+    .bind(&location.storage_backend)
+    .bind(&location.object_key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// 지워야 할 녹화본 객체 중 이 저장소에 있는 것들의 키.
 pub async fn pending_deletions(pool: &SqlitePool, backend: &str) -> anyhow::Result<Vec<String>> {
     Ok(sqlx::query_scalar(

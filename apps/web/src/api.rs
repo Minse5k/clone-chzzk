@@ -4,8 +4,8 @@ use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::{Deserialize, de::DeserializeOwned};
 use shared::{
     AuthResponse, Broadcast, Credentials, LOGIN_PATH, LOGOUT_PATH, ME_PATH, SIGNUP_PATH,
-    UPLOAD_POLICY_PATH, UploadPolicy, User, broadcast_path, live_playlist_path, recording_path,
-    registration_fields,
+    UPLOAD_POLICY_PATH, UpdateBroadcast, UploadPolicy, User, broadcast_end_path, broadcast_path,
+    live_playlist_path, recording_path, registration_fields,
 };
 use uuid::Uuid;
 use web_sys::{File, FormData};
@@ -139,6 +139,39 @@ pub async fn logout() -> ApiResult<()> {
     } else {
         Err(error_message(response).await)
     }
+}
+
+/// 방송 제목을 바꾼다(소유자만).
+pub async fn update_broadcast(id: Uuid, title: &str) -> ApiResult<Broadcast> {
+    let request = authorized(Request::patch(&url(&broadcast_path(id))))
+        .json(&UpdateBroadcast {
+            title: title.to_owned(),
+        })
+        .map_err(|_| "요청을 준비할 수 없습니다.".to_owned())?;
+    read_json(request.send().await).await
+}
+
+/// 방송을 지운다(소유자만, 종료된 방송만).
+pub async fn delete_broadcast(id: Uuid) -> ApiResult<()> {
+    let response = authorized(Request::delete(&url(&broadcast_path(id))))
+        .send()
+        .await
+        .map_err(|_| "서버에 연결할 수 없습니다.".to_owned())?;
+    if response.ok() {
+        Ok(())
+    } else {
+        Err(error_message(response).await)
+    }
+}
+
+/// 라이브 방송을 종료한다(소유자만). 송출하던 기기가 아니어도 된다.
+pub async fn end_broadcast(id: Uuid) -> ApiResult<Broadcast> {
+    read_json(
+        authorized(Request::post(&url(&broadcast_end_path(id))))
+            .send()
+            .await,
+    )
+    .await
 }
 
 #[derive(Deserialize)]
