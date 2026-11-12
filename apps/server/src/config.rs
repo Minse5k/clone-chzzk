@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, path::PathBuf};
+use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::Context;
 
@@ -21,6 +21,10 @@ pub struct Config {
     pub live_dir: PathBuf,
     /// 송출을 HLS로 바꾸는 ffmpeg 실행 파일.
     pub ffmpeg_path: PathBuf,
+    /// 동시에 진행할 수 있는 라이브 방송 수. 송출마다 ffmpeg가 CPU로 인코딩하므로 VM에 맞춘다.
+    pub max_live_broadcasts: usize,
+    /// 송출 중에 녹화 조각이 이 시간 동안 오지 않으면 방송을 종료한다.
+    pub live_idle_timeout: Duration,
 }
 
 /// 녹화본 저장소 백엔드. `STORAGE_BACKEND`로 고른다(기본 `local`).
@@ -113,7 +117,19 @@ impl Config {
                 .map(PathBuf::from),
             live_dir: env_or("LIVE_DIR", "data/live").into(),
             ffmpeg_path: env_or("FFMPEG_PATH", "ffmpeg").into(),
+            max_live_broadcasts: env_number("MAX_LIVE_BROADCASTS", 2)?,
+            live_idle_timeout: Duration::from_secs(env_number("LIVE_IDLE_TIMEOUT_SECS", 20)?),
         })
+    }
+}
+
+fn env_number<T: std::str::FromStr>(key: &str, default: T) -> anyhow::Result<T> {
+    match env::var(key) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{key}는 0 이상의 정수여야 합니다: {value}")),
+        Err(_) => Ok(default),
     }
 }
 

@@ -412,8 +412,18 @@ fn LiveBroadcast() -> Element {
         }
     });
 
+    // 송출 중에는 페이지를 떠나기 전에 경고하고, 휴대폰 화면이 저절로 꺼지지 않게 한다.
+    use_effect(move || {
+        let on_air = matches!(
+            *phase.read(),
+            LivePhase::Connecting | LivePhase::Live { .. } | LivePhase::Stopping { .. }
+        );
+        guard_on_air(on_air);
+    });
+
     // 화면을 떠나면 송출을 끊고(방송 종료) 카메라를 끈다.
     use_drop(move || {
+        guard_on_air(false);
         session.write().take();
         if let Some(stream) = camera.write().take() {
             live::stop_camera(&stream);
@@ -588,9 +598,14 @@ fn LiveBroadcast() -> Element {
                     },
                     LivePhase::Live { broadcast, .. } => rsx! {
                         p { class: "hint", role: "status",
-                            "송출 중입니다. 시청 화면: "
+                            "송출 중입니다. 시청자는 아래 공유 URL로 볼 수 있습니다("
                             Link { to: Route::BroadcastDetail { id: broadcast.id.to_string() }, new_tab: true, "새 탭에서 열기" }
+                            ")."
                         }
+                        p { class: "hint",
+                            "다른 앱으로 넘어가거나 화면을 끄면 송출이 멈추고, 영상이 {LIVE_IDLE_HINT_SECS}초 동안 오지 않으면 방송이 종료됩니다."
+                        }
+                        ShareUrl { id: broadcast.id.to_string() }
                     },
                     LivePhase::Ended { broadcast, reason } => rsx! {
                         div { class: "ended-box", role: "status",
@@ -618,6 +633,47 @@ fn LiveBroadcast() -> Element {
             }
         }
     }
+}
+
+/// 서버가 영상이 오지 않는 송출을 끝내기까지의 기본 시간(`LIVE_IDLE_TIMEOUT_SECS`). 안내 문구용.
+const LIVE_IDLE_HINT_SECS: u32 = 20;
+
+/// 송출 중 보호 장치를 켜거나 끈다.
+/// - 새로고침·탭 닫기 전에 브라우저가 확인을 묻는다(송출이 끊기면 방송이 종료되므로).
+/// - 화면 꺼짐 방지(Screen Wake Lock)를 요청한다. 지원하지 않는 브라우저에서는 조용히 넘어간다.
+///   다른 앱에 갔다 돌아오면 브라우저가 풀어 버리므로 다시 요청한다.
+fn guard_on_air(on_air: bool) {
+    let script = r#"
+        const onAir = await dioxus.recv();
+        if (onAir) {
+            window.onbeforeunload = (event) => { event.preventDefault(); event.returnValue = ""; };
+            const lock = async () => {
+                if (!navigator.wakeLock || document.visibilityState !== "visible" || window.__chzzkWakeLock) return;
+                try {
+                    const sentinel = await navigator.wakeLock.request("screen");
+                    sentinel.addEventListener("release", () => { window.__chzzkWakeLock = null; });
+                    window.__chzzkWakeLock = sentinel;
+                } catch (_) {}
+            };
+            if (!window.__chzzkRelock) {
+                window.__chzzkRelock = lock;
+                document.addEventListener("visibilitychange", lock);
+            }
+            await lock();
+        } else {
+            window.onbeforeunload = null;
+            if (window.__chzzkRelock) {
+                document.removeEventListener("visibilitychange", window.__chzzkRelock);
+                window.__chzzkRelock = null;
+            }
+            if (window.__chzzkWakeLock) {
+                const sentinel = window.__chzzkWakeLock;
+                window.__chzzkWakeLock = null;
+                try { await sentinel.release(); } catch (_) {}
+            }
+        }
+    "#;
+    let _ = document::eval(script).send(on_air);
 }
 
 /// 송출 경과 시간. 예: `03:25`, `1:02:03`.

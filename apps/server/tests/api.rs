@@ -100,6 +100,8 @@ impl TestServer {
             web_dist_dir: None,
             live_dir: dir.path().join("live"),
             ffmpeg_path: "ffmpeg".into(),
+            max_live_broadcasts: 2,
+            live_idle_timeout: std::time::Duration::from_secs(20),
         }
     }
 

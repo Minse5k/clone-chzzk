@@ -4,6 +4,7 @@
 use std::{
     path::{Path as FsPath, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 
@@ -24,12 +25,13 @@ use shared::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::{
-    AppState,
+    AppState, Config,
     api::{ApiError, validate_title},
     db::{self, InsertError, RecordingLocation},
 };
@@ -50,6 +52,10 @@ pub async fn ingest(State(state): State<AppState>, ws: WebSocketUpgrade) -> Resp
 async fn run_ingest(state: AppState, mut socket: WebSocket) {
     let title = match receive_start(&mut socket).await {
         Ok(title) => title,
+        Err(message) => return reject(socket, message).await,
+    };
+    let (_slot, limit) = match admit(&state).await {
+        Ok(admitted) => admitted,
         Err(message) => return reject(socket, message).await,
     };
 
@@ -91,7 +97,13 @@ async fn run_ingest(state: AppState, mut socket: WebSocket) {
     };
     send(&mut socket, &IngestServerMessage::Started { broadcast }).await;
 
-    let reason = relay(&mut socket, &mut encoder).await;
+    let reason = relay(
+        &mut socket,
+        &mut encoder,
+        limit,
+        state.config.live_idle_timeout,
+    )
+    .await;
 
     // 상태를 먼저 종료로 바꿔, 마무리하는 동안에도 시청자가 라이브로 착각하지 않게 한다.
     if let Err(err) = db::end_broadcast(&state.db, id, Utc::now()).await {
@@ -184,6 +196,100 @@ async fn make_recording(state: &AppState, id: Uuid, dir: &FsPath) -> anyhow::Res
     }
 }
 
+/// 송출을 받을 수 있는 서버 상태. 서버를 시작할 때 한 번 확인한다.
+pub struct LiveCapacity {
+    ffmpeg_available: bool,
+    max_live_broadcasts: usize,
+    slots: Arc<Semaphore>,
+}
+
+impl LiveCapacity {
+    /// ffmpeg를 실행할 수 있는지 확인한다. 없어도 서버는 시작하고 송출만 거부한다.
+    pub async fn check(config: &Config) -> Self {
+        let ffmpeg_available = Command::new(&config.ffmpeg_path)
+            .arg("-version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success());
+        if !ffmpeg_available {
+            tracing::warn!(
+                "ffmpeg({})를 실행할 수 없어 라이브 송출을 받지 않습니다. 녹화방송 기능은 그대로 동작합니다",
+                config.ffmpeg_path.display()
+            );
+        }
+        Self {
+            ffmpeg_available,
+            max_live_broadcasts: config.max_live_broadcasts,
+            slots: Arc::new(Semaphore::new(config.max_live_broadcasts)),
+        }
+    }
+}
+
+/// 송출 하나가 받을 수 있는 녹화 조각 크기의 합.
+#[derive(Clone, Copy)]
+struct ReceiveLimit {
+    max_bytes: u64,
+    /// 녹화본 상한이 아니라 남은 저장 공간 때문에 정해진 한도인지.
+    by_quota: bool,
+}
+
+impl ReceiveLimit {
+    fn reason(self) -> String {
+        if self.by_quota {
+            "저장 공간 한도에 닿아 방송을 종료했습니다.".into()
+        } else {
+            format!(
+                "녹화본 크기 상한({})에 닿아 방송을 종료했습니다.",
+                format_bytes(self.max_bytes)
+            )
+        }
+    }
+}
+
+/// 송출을 시작해도 되는지 확인한다. 받아들이면 동시 라이브 자리 하나와 받을 수 있는 크기를 돌려준다.
+async fn admit(state: &AppState) -> Result<(OwnedSemaphorePermit, ReceiveLimit), String> {
+    let live = &state.live;
+    if !live.ffmpeg_available {
+        return Err(
+            "서버에 ffmpeg가 없어 라이브 송출을 할 수 없습니다. 녹화방송 등록과 시청은 그대로 쓸 수 있습니다."
+                .into(),
+        );
+    }
+    let used = db::total_recording_bytes(&state.db).await.map_err(|err| {
+        tracing::error!("저장 공간을 확인할 수 없습니다: {err:#}");
+        "송출을 시작할 수 없습니다. 잠시 후 다시 시도해 주세요.".to_owned()
+    })?;
+    let remaining = state.config.storage_quota_bytes.saturating_sub(used);
+    if remaining == 0 {
+        return Err("저장 공간 한도에 도달해 더 이상 방송을 시작할 수 없습니다.".into());
+    }
+    let slot = live.slots.clone().try_acquire_owned().map_err(|_| {
+        format!(
+            "지금은 동시에 진행할 수 있는 라이브 방송 수({}개)가 모두 차 있습니다. 잠시 후 다시 시도해 주세요.",
+            live.max_live_broadcasts
+        )
+    })?;
+    let limit = ReceiveLimit {
+        max_bytes: state.config.max_upload_bytes.min(remaining),
+        by_quota: remaining < state.config.max_upload_bytes,
+    };
+    Ok((slot, limit))
+}
+
+/// 서버가 송출 도중에 멈춰 라이브 중으로 남은 방송을 종료하고, 남은 조각이 있으면 녹화본으로 만든다.
+pub async fn recover(state: &AppState) -> anyhow::Result<()> {
+    let leftovers = db::list_broadcasts(&state.db, Some(BroadcastStatus::Live)).await?;
+    for broadcast in leftovers {
+        tracing::warn!(broadcast = %broadcast.id, "서버 재시작 전의 라이브 방송을 종료합니다");
+        db::end_broadcast(&state.db, broadcast.id, Utc::now()).await?;
+        save_recording(state, broadcast.id).await;
+    }
+    Ok(())
+}
+
 /// 첫 메시지로 송출 시작을 받아 검증한 제목을 돌려준다.
 async fn receive_start(socket: &mut WebSocket) -> Result<String, String> {
     let message = tokio::time::timeout(START_TIMEOUT, socket.recv())
@@ -203,25 +309,40 @@ async fn receive_start(socket: &mut WebSocket) -> Result<String, String> {
 
 /// 녹화 조각을 ffmpeg로 흘려 넣는다. 송출자가 끝내거나 연결이 끊기면 `None`,
 /// 서버 사정으로 끝내야 하면 송출자에게 보여 줄 이유를 돌려준다.
-async fn relay(socket: &mut WebSocket, encoder: &mut HlsEncoder) -> Option<String> {
-    while let Some(message) = socket.recv().await {
+async fn relay(
+    socket: &mut WebSocket,
+    encoder: &mut HlsEncoder,
+    limit: ReceiveLimit,
+    idle_timeout: Duration,
+) -> Option<String> {
+    let mut received: u64 = 0;
+    loop {
+        let Ok(message) = tokio::time::timeout(idle_timeout, socket.recv()).await else {
+            return Some(format!(
+                "{}초 동안 영상이 오지 않아 방송을 종료했습니다.",
+                idle_timeout.as_secs()
+            ));
+        };
         match message {
-            Ok(Message::Binary(chunk)) => {
+            Some(Ok(Message::Binary(chunk))) => {
+                received += chunk.len() as u64;
+                if received > limit.max_bytes {
+                    return Some(limit.reason());
+                }
                 if let Err(err) = encoder.write(&chunk).await {
                     tracing::warn!(broadcast = %encoder.id, "ffmpeg에 조각을 넘길 수 없습니다: {err}");
                     return Some("영상을 처리하는 중 문제가 생겨 방송을 종료했습니다.".into());
                 }
             }
-            Ok(Message::Text(text)) => {
+            Some(Ok(Message::Text(text))) => {
                 if let Ok(IngestClientMessage::End) = serde_json::from_str(&text) {
                     return None;
                 }
             }
-            Ok(Message::Close(_)) | Err(_) => return None,
-            Ok(Message::Ping(_) | Message::Pong(_)) => {}
+            Some(Ok(Message::Close(_)) | Err(_)) | None => return None,
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
         }
     }
-    None
 }
 
 async fn reject(mut socket: WebSocket, message: impl Into<String>) {
