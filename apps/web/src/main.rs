@@ -135,16 +135,13 @@ const LIVE_REFRESH_MILLIS: u32 = 3000;
 fn BroadcastDetail(id: ReadSignal<String>) -> Element {
     let mut broadcast = use_resource(move || async move { api::get_broadcast(&id()).await });
 
-    // 라이브 중인 방송은 첫 조각이 만들어졌는지, 종료되었는지 주기적으로 다시 불러온다.
+    // 라이브 중이거나 녹화본을 만드는 중인 방송은 주기적으로 다시 불러온다.
     // 다시 불러오는 동안에도 이전 값이 남아 있어 플레이어가 다시 만들어지지 않는다.
     use_future(move || async move {
         loop {
             TimeoutFuture::new(LIVE_REFRESH_MILLIS).await;
-            let live = matches!(
-                &*broadcast.peek(),
-                Some(Ok(Some(b))) if b.status == BroadcastStatus::Live
-            );
-            if live {
+            let changing = matches!(&*broadcast.peek(), Some(Ok(Some(b))) if may_change(b));
+            if changing {
                 broadcast.restart();
             }
         }
@@ -168,6 +165,11 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
                     }
                 } else if broadcast.live_playlist {
                     LivePlayer { id: broadcast.id }
+                    if broadcast.status == BroadcastStatus::Ended {
+                        p { class: "notice", role: "status",
+                            "방송이 종료되었습니다. 녹화본을 준비하고 있습니다. 준비되면 이 화면에서 바로 다시 볼 수 있습니다."
+                        }
+                    }
                 } else if broadcast.status == BroadcastStatus::Live {
                     p { class: "notice player-placeholder", "방송을 준비하고 있습니다. 잠시 후 영상이 나옵니다…" }
                 } else {
@@ -178,15 +180,27 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
                     h1 { "{broadcast.title}" }
                 }
                 p { class: "meta",
-                    match broadcast.status {
-                        BroadcastStatus::Live => rsx! { "송출 시작 " {format_time(broadcast.created_at)} },
-                        BroadcastStatus::Ended => rsx! { "등록 " {format_time(broadcast.created_at)} },
+                    match broadcast.ended_at {
+                        None => rsx! { "송출 시작 " {format_time(broadcast.created_at)} },
+                        // 방송 등록으로 생긴 방송은 등록 시각에 이미 종료된 방송이다.
+                        Some(ended_at) if ended_at == broadcast.created_at => rsx! {
+                            "등록 " {format_time(broadcast.created_at)}
+                        },
+                        Some(ended_at) => rsx! {
+                            "방송 " {format_time(broadcast.created_at)} " ~ " {format_time(ended_at)}
+                        },
                     }
                 }
                 ShareUrl { id: broadcast.id.to_string() }
             }
         },
     }
+}
+
+/// 다시 불러오면 바뀔 수 있는 방송: 라이브 중이거나, 끝났지만 녹화본을 아직 만드는 중이다.
+fn may_change(broadcast: &Broadcast) -> bool {
+    broadcast.status == BroadcastStatus::Live
+        || (broadcast.recording.is_none() && broadcast.live_playlist)
 }
 
 const LIVE_PLAYER_ID: &str = "live-player";

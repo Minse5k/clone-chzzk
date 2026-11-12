@@ -19,18 +19,23 @@ use axum::{
 use chrono::Utc;
 use shared::{
     Broadcast, BroadcastStatus, IngestClientMessage, IngestServerMessage, LIVE_PLAYLIST_FILE,
+    Recording, format_bytes,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
 };
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::{
     AppState,
     api::{ApiError, validate_title},
-    db,
+    db::{self, InsertError, RecordingLocation},
 };
+
+/// 녹화본을 저장소에 올리기 전에 라이브 디렉터리 안에서 묶는 mp4 파일 이름.
+const RECORDING_FILE: &str = "recording.mp4";
 
 /// 연결 후 시작 메시지를 기다리는 시간.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -97,6 +102,86 @@ async fn run_ingest(state: AppState, mut socket: WebSocket) {
 
     send(&mut socket, &IngestServerMessage::Ended { reason }).await;
     let _ = socket.send(Message::Close(None)).await;
+    drop(socket);
+
+    save_recording(&state, id).await;
+}
+
+/// 끝난 송출의 HLS 조각을 다시 인코딩 없이 mp4로 묶어 녹화본 저장소에 넣고 라이브 디렉터리를 지운다.
+/// 녹화본을 만들 수 없으면(조각 없음, 저장 총량 초과) 녹화본 없이 종료된 방송으로 남는다.
+pub async fn save_recording(state: &AppState, id: Uuid) {
+    let dir = live_dir(state, id);
+    match make_recording(state, id, &dir).await {
+        Ok(Some(size)) => tracing::info!(broadcast = %id, "녹화본 저장: {}", format_bytes(size)),
+        Ok(None) => {}
+        Err(err) => tracing::error!(broadcast = %id, "녹화본을 만들 수 없습니다: {err:#}"),
+    }
+    if let Err(err) = tokio::fs::remove_dir_all(&dir).await
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(broadcast = %id, "라이브 디렉터리를 지울 수 없습니다: {err}");
+    }
+}
+
+/// 녹화본을 만들어 저장하고 크기를 돌려준다. 만들 녹화본이 없으면 `None`.
+async fn make_recording(state: &AppState, id: Uuid, dir: &FsPath) -> anyhow::Result<Option<u64>> {
+    let playlist = dir.join(LIVE_PLAYLIST_FILE);
+    if !tokio::fs::try_exists(&playlist).await? {
+        tracing::info!(broadcast = %id, "송출된 영상이 없어 녹화본을 만들지 않습니다");
+        return Ok(None);
+    }
+
+    let mp4 = dir.join(RECORDING_FILE);
+    let status = Command::new(&state.config.ffmpeg_path)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&playlist)
+        // 재생을 바로 시작할 수 있도록 색인(moov)을 앞에 둔다.
+        .args(["-c", "copy", "-movflags", "+faststart"])
+        .arg(&mp4)
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .status()
+        .await?;
+    anyhow::ensure!(
+        status.success(),
+        "ffmpeg가 녹화본을 묶지 못했습니다: {status}"
+    );
+    let size = tokio::fs::metadata(&mp4).await?.len();
+
+    // 큰 녹화본을 저장소에 올렸다가 지우지 않도록 먼저 확인한다. 기록할 때 한 번 더 확인한다.
+    let used = db::total_recording_bytes(&state.db).await?;
+    if used.saturating_add(size) > state.config.storage_quota_bytes {
+        tracing::warn!(broadcast = %id, "저장 총량 한도를 넘어 녹화본을 남기지 않습니다");
+        return Ok(None);
+    }
+
+    let key = format!("{id}.mp4");
+    let file = tokio::fs::File::open(&mp4).await?;
+    state.store.put(&key, ReaderStream::new(file)).await?;
+    let recording = Recording {
+        content_type: "video/mp4".into(),
+        size_bytes: size,
+    };
+    let location = RecordingLocation {
+        storage_backend: state.store.backend_name().into(),
+        object_key: key.clone(),
+    };
+    let quota = state.config.storage_quota_bytes;
+    match db::insert_recording(&state.db, id, &recording, &location, quota).await {
+        Ok(()) => Ok(Some(size)),
+        Err(err) => {
+            if let Err(err) = state.store.delete(&key).await {
+                tracing::error!(broadcast = %id, "녹화본 정리 실패: {err:#}");
+            }
+            match err {
+                InsertError::QuotaExceeded => {
+                    tracing::warn!(broadcast = %id, "저장 총량 한도를 넘어 녹화본을 남기지 않습니다");
+                    Ok(None)
+                }
+                InsertError::Other(err) => Err(err),
+            }
+        }
+    }
 }
 
 /// 첫 메시지로 송출 시작을 받아 검증한 제목을 돌려준다.

@@ -13,7 +13,8 @@ use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
 use shared::{
     Broadcast, BroadcastStatus, IngestClientMessage, IngestServerMessage, LIVE_INGEST_PATH,
-    broadcast_path, broadcasts_path, live_playlist_path,
+    UPLOAD_POLICY_PATH, UploadPolicy, broadcast_path, broadcasts_path, live_playlist_path,
+    recording_path,
 };
 use tempfile::TempDir;
 use tokio::net::TcpStream;
@@ -25,7 +26,7 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// 임시 DB·저장소·라이브 디렉터리를 쓰고 실제 포트에서 요청을 받는 서버.
 struct LiveServer {
-    _dir: TempDir,
+    dir: TempDir,
     app: Router,
     addr: SocketAddr,
 }
@@ -38,6 +39,10 @@ struct Response {
 
 impl LiveServer {
     async fn start() -> Self {
+        Self::with_quota(1024 * 1024 * 1024).await
+    }
+
+    async fn with_quota(storage_quota_bytes: u64) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let config = server::Config {
             database_path: dir.path().join("test.db"),
@@ -46,7 +51,7 @@ impl LiveServer {
             },
             cors_allowed_origins: vec!["http://localhost:8080".into()],
             max_upload_bytes: 100 * 1024 * 1024,
-            storage_quota_bytes: 1024 * 1024 * 1024,
+            storage_quota_bytes,
             web_dist_dir: None,
             live_dir: dir.path().join("live"),
             ffmpeg_path: "ffmpeg".into(),
@@ -55,11 +60,7 @@ impl LiveServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(axum::serve(listener, app.clone()).into_future());
-        Self {
-            _dir: dir,
-            app,
-            addr,
-        }
+        Self { dir, app, addr }
     }
 
     async fn get(&self, uri: &str) -> Response {
@@ -91,6 +92,24 @@ impl LiveServer {
 
     async fn broadcast(&self, id: Uuid) -> Broadcast {
         self.get_json(&broadcast_path(id)).await
+    }
+
+    /// 송출이 끝난 뒤 녹화본 처리가 끝나(라이브 디렉터리가 지워질 때까지) 기다린다.
+    async fn wait_until_finalized(&self, id: Uuid) -> Broadcast {
+        let live_dir = self.dir.path().join("live").join(id.to_string());
+        for _ in 0..200 {
+            if !live_dir.exists() {
+                return self.broadcast(id).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("20초 안에 녹화본 처리가 끝나지 않았습니다");
+    }
+
+    async fn stored_recordings(&self) -> usize {
+        std::fs::read_dir(self.dir.path().join("recordings"))
+            .unwrap()
+            .count()
     }
 
     async fn connect(&self) -> Socket {
@@ -232,17 +251,79 @@ async fn 송출하면_라이브_방송이_생기고_hls로_시청되며_종료�
     let ended = server.broadcast(started.id).await;
     assert_eq!(ended.status, BroadcastStatus::Ended);
     assert!(ended.ended_at.unwrap() >= ended.created_at);
-    // 송출이 끝나면 재생 목록이 끝맺어진다.
-    let playlist = server.get(&live_playlist_path(started.id)).await;
-    assert!(
-        String::from_utf8(playlist.body)
-            .unwrap()
-            .contains("#EXT-X-ENDLIST")
-    );
     let live: Vec<Broadcast> = server
         .get_json(&broadcasts_path(Some(BroadcastStatus::Live)))
         .await;
     assert!(live.is_empty());
+}
+
+#[tokio::test]
+async fn 종료된_라이브_방송은_녹화본으로_다시_볼_수_있다() {
+    let server = LiveServer::start().await;
+    let (mut socket, started) = server.start_broadcast("녹화될 라이브").await;
+    send_video(&mut socket, &sample_webm(4)).await;
+    server
+        .wait_for(started.id, "라이브 재생 가능", |b| b.live_playlist)
+        .await;
+    send(&mut socket, &IngestClientMessage::End).await;
+    receive(&mut socket).await;
+
+    let ended = server
+        .wait_for(started.id, "녹화본 있음", |b| b.recording.is_some())
+        .await;
+
+    let recording = ended.recording.as_ref().unwrap();
+    assert_eq!(recording.content_type, "video/mp4");
+    let video = server.get(&recording_path(started.id)).await;
+    assert_eq!(video.status, StatusCode::OK);
+    assert_eq!(video.content_type, "video/mp4");
+    assert_eq!(video.body.len() as u64, recording.size_bytes);
+    assert_eq!(&video.body[4..8], b"ftyp");
+
+    // 녹화본을 만든 뒤에는 라이브 재생 목록이 남지 않는다.
+    let finalized = server.wait_until_finalized(started.id).await;
+    assert!(!finalized.live_playlist);
+    let playlist = server.get(&live_playlist_path(started.id)).await;
+    assert_eq!(playlist.status, StatusCode::NOT_FOUND);
+
+    // 녹화본 크기가 저장 총량 사용량에 들어간다.
+    let policy: UploadPolicy = server.get_json(UPLOAD_POLICY_PATH).await;
+    assert_eq!(
+        policy.remaining_bytes,
+        1024 * 1024 * 1024 - recording.size_bytes
+    );
+}
+
+#[tokio::test]
+async fn 영상을_보내지_않고_끝난_라이브_방송은_녹화본_없이_종료된다() {
+    let server = LiveServer::start().await;
+    let (mut socket, started) = server.start_broadcast("빈 방송").await;
+
+    send(&mut socket, &IngestClientMessage::End).await;
+    receive(&mut socket).await;
+
+    let ended = server.wait_until_finalized(started.id).await;
+    assert_eq!(ended.status, BroadcastStatus::Ended);
+    assert_eq!(ended.recording, None);
+    assert!(!ended.live_playlist);
+    assert_eq!(server.stored_recordings().await, 0);
+}
+
+#[tokio::test]
+async fn 저장_총량을_넘는_녹화본은_남기지_않는다() {
+    let server = LiveServer::with_quota(10 * 1024).await;
+    let (mut socket, started) = server.start_broadcast("한도 넘는 라이브").await;
+    send_video(&mut socket, &sample_webm(3)).await;
+    server
+        .wait_for(started.id, "라이브 재생 가능", |b| b.live_playlist)
+        .await;
+    send(&mut socket, &IngestClientMessage::End).await;
+    receive(&mut socket).await;
+
+    let ended = server.wait_until_finalized(started.id).await;
+    assert_eq!(ended.status, BroadcastStatus::Ended);
+    assert_eq!(ended.recording, None);
+    assert_eq!(server.stored_recordings().await, 0);
 }
 
 #[tokio::test]

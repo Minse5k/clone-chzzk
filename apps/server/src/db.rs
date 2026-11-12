@@ -182,12 +182,7 @@ pub async fn insert_broadcast(
 ) -> Result<(), InsertError> {
     // BEGIN IMMEDIATE로 쓰기 잠금을 먼저 잡아, 합 확인과 기록 사이에 다른 등록이 끼지 못하게 한다.
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let total: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes), 0) FROM recordings")
-        .fetch_one(&mut *tx)
-        .await?;
-    if u64::try_from(total)?.saturating_add(new.recording.size_bytes) > storage_quota_bytes {
-        return Err(InsertError::QuotaExceeded);
-    }
+    check_quota(&mut tx, new.recording.size_bytes, storage_quota_bytes).await?;
     let created_at = format_time(new.created_at);
     sqlx::query("INSERT INTO broadcasts (id, title, created_at, ended_at) VALUES (?, ?, ?, ?)")
         .bind(new.id.to_string())
@@ -196,18 +191,58 @@ pub async fn insert_broadcast(
         .bind(&created_at)
         .execute(&mut *tx)
         .await?;
+    insert_recording_row(&mut tx, new.id, &new.recording, &new.recording_location).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 종료된 라이브 방송에 녹화본을 붙인다. 방송 등록과 같은 규칙으로 저장 총량 한도를 확인한다.
+pub async fn insert_recording(
+    pool: &SqlitePool,
+    broadcast_id: Uuid,
+    recording: &Recording,
+    location: &RecordingLocation,
+    storage_quota_bytes: u64,
+) -> Result<(), InsertError> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    check_quota(&mut tx, recording.size_bytes, storage_quota_bytes).await?;
+    insert_recording_row(&mut tx, broadcast_id, recording, location).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 녹화본을 더해도 저장 총량 한도를 넘지 않는지 같은 트랜잭션 안에서 확인한다.
+async fn check_quota(
+    tx: &mut sqlx::SqliteConnection,
+    size_bytes: u64,
+    storage_quota_bytes: u64,
+) -> Result<(), InsertError> {
+    let total: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes), 0) FROM recordings")
+        .fetch_one(&mut *tx)
+        .await?;
+    if u64::try_from(total)?.saturating_add(size_bytes) > storage_quota_bytes {
+        return Err(InsertError::QuotaExceeded);
+    }
+    Ok(())
+}
+
+async fn insert_recording_row(
+    tx: &mut sqlx::SqliteConnection,
+    broadcast_id: Uuid,
+    recording: &Recording,
+    location: &RecordingLocation,
+) -> Result<(), InsertError> {
     sqlx::query(
         "INSERT INTO recordings (broadcast_id, storage_backend, object_key, content_type, size_bytes) \
          VALUES (?, ?, ?, ?, ?)",
     )
-    .bind(new.id.to_string())
-    .bind(&new.recording_location.storage_backend)
-    .bind(&new.recording_location.object_key)
-    .bind(&new.recording.content_type)
-    .bind(i64::try_from(new.recording.size_bytes)?)
+    .bind(broadcast_id.to_string())
+    .bind(&location.storage_backend)
+    .bind(&location.object_key)
+    .bind(&recording.content_type)
+    .bind(i64::try_from(recording.size_bytes)?)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
