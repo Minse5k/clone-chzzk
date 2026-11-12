@@ -3,8 +3,8 @@
 use gloo_net::http::{Request, Response};
 use serde::{Deserialize, de::DeserializeOwned};
 use shared::{
-    Broadcast, UPLOAD_POLICY_PATH, UploadPolicy, broadcast_path, recording_path,
-    registration_fields,
+    Broadcast, UPLOAD_POLICY_PATH, UploadPolicy, broadcast_path, live_playlist_path,
+    recording_path, registration_fields,
 };
 use uuid::Uuid;
 use web_sys::{File, FormData};
@@ -49,6 +49,29 @@ pub async fn get_upload_policy() -> ApiResult<UploadPolicy> {
 /// 녹화본 재생 주소. `<video src>`에 그대로 쓴다.
 pub fn recording_url(id: Uuid) -> String {
     url(&recording_path(id))
+}
+
+/// 라이브 재생 목록(HLS) 주소.
+pub fn live_playlist_url(id: Uuid) -> String {
+    url(&live_playlist_path(id))
+}
+
+/// WebSocket 주소. 같은 출처로 서빙될 때는(API 주소가 비어 있으면) 지금 열린 주소를 쓴다.
+/// HTTPS로 열렸으면 `wss://`가 된다.
+pub fn ws_url(path: &str) -> String {
+    let base = if API_BASE_URL.is_empty() {
+        web_sys::window()
+            .and_then(|window| window.location().origin().ok())
+            .unwrap_or_default()
+    } else {
+        API_BASE_URL.trim_end_matches('/').to_owned()
+    };
+    let base = match base.split_once("://") {
+        Some(("https", rest)) => format!("wss://{rest}"),
+        Some(("http", rest)) => format!("ws://{rest}"),
+        _ => base,
+    };
+    format!("{base}{path}")
 }
 
 /// 제목과 녹화본으로 방송을 등록한다. 파일은 메모리에 읽지 않고 브라우저가 그대로 전송한다.

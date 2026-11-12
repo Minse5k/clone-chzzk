@@ -7,7 +7,9 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::Value;
-use shared::{Broadcast, UPLOAD_POLICY_PATH, UploadPolicy, recording_path};
+use shared::{
+    Broadcast, BroadcastStatus, UPLOAD_POLICY_PATH, UploadPolicy, broadcasts_path, recording_path,
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -96,6 +98,10 @@ impl TestServer {
             max_upload_bytes: limits.max_upload_bytes,
             storage_quota_bytes: limits.storage_quota_bytes,
             web_dist_dir: None,
+            live_dir: dir.path().join("live"),
+            ffmpeg_path: "ffmpeg".into(),
+            max_live_broadcasts: 2,
+            live_idle_timeout: std::time::Duration::from_secs(20),
         }
     }
 
@@ -218,6 +224,35 @@ impl TestServer {
         assert_eq!(response.error_message(), message);
         assert_eq!(self.list_broadcasts().await, before_list);
         assert_eq!(self.stored_file_count(), before_files);
+    }
+
+    /// 테스트 DB에 직접 연결한다. API로 아직 만들 수 없는 상태를 준비할 때 쓴다.
+    async fn db(&self) -> sqlx::SqlitePool {
+        sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(self.dir.path().join("test.db")),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// 송출 중인(종료 시각이 없는) 방송을 DB에 직접 넣는다.
+    async fn insert_live_broadcast(&self, title: &str) -> uuid::Uuid {
+        let id = uuid::Uuid::now_v7();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        sqlx::query("INSERT INTO broadcasts (id, title, created_at) VALUES (?, ?, ?)")
+            .bind(id.to_string())
+            .bind(title)
+            .bind(now)
+            .execute(&self.db().await)
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn list_by_status(&self, status: BroadcastStatus) -> Vec<Broadcast> {
+        let response = self.get(&broadcasts_path(Some(status))).await;
+        assert_eq!(response.status, StatusCode::OK);
+        response.json()
     }
 
     /// local 저장소에 남아 있는 파일 수.
@@ -605,4 +640,115 @@ async fn 웹_정적_파일_디렉터리에_index_html이_없으면_시작하지_
     let error = server::build_app(config).await.err().unwrap();
 
     assert!(error.to_string().contains("index.html"), "{error}");
+}
+
+#[tokio::test]
+async fn 방송_등록으로_만든_방송은_종료_상태다() {
+    let server = TestServer::start().await;
+
+    let created = server.register("녹화 방송", &sample_video(10)).await;
+
+    assert_eq!(created.status, BroadcastStatus::Ended);
+    assert_eq!(created.ended_at, Some(created.created_at));
+    let detail = server.get(&format!("/api/broadcasts/{}", created.id)).await;
+    assert_eq!(detail.json::<Broadcast>(), created);
+}
+
+#[tokio::test]
+async fn 종료_시각이_없는_방송은_라이브_중으로_조회된다() {
+    let server = TestServer::start().await;
+    let id = server.insert_live_broadcast("송출 중인 방송").await;
+
+    let detail: Broadcast = server.get(&format!("/api/broadcasts/{id}")).await.json();
+
+    assert_eq!(detail.status, BroadcastStatus::Live);
+    assert_eq!(detail.ended_at, None);
+    assert_eq!(detail.recording, None);
+}
+
+#[tokio::test]
+async fn 방송_목록을_상태로_거를_수_있다() {
+    let server = TestServer::start().await;
+    let old = server.register("지난 방송", &sample_video(10)).await;
+    let live_id = server.insert_live_broadcast("라이브 방송").await;
+    let newer = server
+        .register("더 최근 지난 방송", &sample_video(10))
+        .await;
+
+    let live = server.list_by_status(BroadcastStatus::Live).await;
+    assert_eq!(live.iter().map(|b| b.id).collect::<Vec<_>>(), vec![live_id]);
+
+    assert_eq!(
+        server.list_by_status(BroadcastStatus::Ended).await,
+        vec![newer.clone(), old.clone()]
+    );
+
+    let all = server.list_broadcasts().await;
+    assert_eq!(
+        all.iter().map(|b| b.id).collect::<Vec<_>>(),
+        vec![newer.id, live_id, old.id]
+    );
+}
+
+#[tokio::test]
+async fn 잘못된_상태로_방송_목록을_요청하면_400이다() {
+    let server = TestServer::start().await;
+
+    let response = server.get("/api/broadcasts?status=onair").await;
+
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.error_message(),
+        "방송 상태는 live 또는 ended만 쓸 수 있습니다."
+    );
+}
+
+#[tokio::test]
+async fn 상태_도입_전에_등록된_방송은_마이그레이션_후_종료_상태가_된다() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+
+    // 과제 1 시점의 스키마(마이그레이션 0001, 0002)로 방송 하나를 남긴다.
+    let mut migrator = sqlx::migrate::Migrator::new(std::path::Path::new("migrations"))
+        .await
+        .unwrap();
+    migrator.migrations = migrator
+        .migrations
+        .iter()
+        .filter(|m| m.version <= 2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true),
+    )
+    .await
+    .unwrap();
+    migrator.run(&pool).await.unwrap();
+    let id = uuid::Uuid::now_v7();
+    let created_at = "2026-11-01T09:00:00.000000Z";
+    sqlx::query("INSERT INTO broadcasts (id, title, created_at) VALUES (?, ?, ?)")
+        .bind(id.to_string())
+        .bind("과제 1 방송")
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let app = server::build_app(TestServer::config(&dir, Limits::default()))
+        .await
+        .unwrap();
+    let server = TestServer {
+        dir,
+        limits: Limits::default(),
+        app,
+    };
+
+    let detail: Broadcast = server.get(&format!("/api/broadcasts/{id}")).await.json();
+    assert_eq!(detail.status, BroadcastStatus::Ended);
+    assert_eq!(detail.ended_at, Some(detail.created_at));
+    assert_eq!(detail.created_at.to_rfc3339(), "2026-11-01T09:00:00+00:00");
 }

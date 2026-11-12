@@ -6,6 +6,7 @@
     --muted: #8b8f98;
     --accent: #00ffa3;
     --danger: #ff6b6b;
+    --live: #e8293b;
 }
 
 * { box-sizing: border-box; }
@@ -37,6 +38,20 @@ a { color: inherit; text-decoration: none; }
 }
 
 h1 { font-size: 22px; margin: 0 0 20px; }
+h2 { font-size: 17px; margin: 0 0 12px; }
+
+.broadcast-section + .broadcast-section { margin-top: 32px; }
+
+.badge {
+    align-self: flex-start;
+    flex: none;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 700;
+}
+.badge.live { background: var(--live); color: #fff; }
+.badge.ended { background: var(--border); color: var(--muted); }
 
 .notice { color: var(--muted); }
 .notice.error { color: var(--danger); }
@@ -63,7 +78,7 @@ h1 { font-size: 22px; margin: 0 0 20px; }
 .broadcast-card .title { font-weight: 700; overflow-wrap: anywhere; }
 .broadcast-card .meta { color: var(--muted); font-size: 13px; }
 
-.topbar .button { margin-left: auto; }
+.topbar .actions { margin-left: auto; display: flex; gap: 8px; }
 
 .button,
 button {
@@ -80,6 +95,13 @@ button {
 
 button:disabled { opacity: 0.6; cursor: progress; }
 
+.button.live,
+button.live { background: var(--live); color: #fff; }
+button.danger { background: var(--danger); color: #0e0f12; }
+button.secondary { background: var(--border); color: var(--text); }
+
+.button-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+
 .broadcast-list a.broadcast-card:hover { border-color: var(--accent); }
 
 .broadcast-detail .player {
@@ -89,7 +111,8 @@ button:disabled { opacity: 0.6; cursor: progress; }
     border-radius: 8px;
 }
 
-.broadcast-detail h1 { margin: 16px 0 6px; overflow-wrap: anywhere; }
+.broadcast-detail .title-row { display: flex; align-items: center; gap: 10px; margin: 16px 0 6px; }
+.broadcast-detail h1 { margin: 0; overflow-wrap: anywhere; }
 .broadcast-detail .meta { color: var(--muted); font-size: 14px; margin: 0; }
 
 .registration-form {
@@ -134,3 +157,67 @@ button:disabled { opacity: 0.6; cursor: progress; }
 
 .not-found { text-align: center; padding: 48px 0; }
 .not-found .notice { margin-bottom: 24px; }
+
+.player-placeholder {
+    display: grid;
+    place-items: center;
+    aspect-ratio: 16 / 9;
+    margin: 0;
+    background: #000;
+    border-radius: 8px;
+}
+
+/* 송출 화면: 넓은 화면에서는 미리보기와 조작 영역을 나란히, 휴대폰에서는 위아래로 둔다. */
+.live-studio {
+    display: grid;
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+    gap: 20px;
+    align-items: start;
+}
+
+@media (max-width: 720px) {
+    .live-studio { grid-template-columns: 1fr; }
+    .topbar { padding: 12px 16px; }
+}
+
+.preview-frame {
+    position: relative;
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+    aspect-ratio: 3 / 4;
+    max-height: 70vh;
+    width: 100%;
+}
+
+.preview { width: 100%; height: 100%; object-fit: contain; display: block; }
+.preview-empty {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    margin: 0;
+    color: var(--muted);
+}
+.on-air { position: absolute; top: 12px; left: 12px; font-size: 14px; }
+
+.live-controls { display: flex; flex-direction: column; gap: 8px; }
+.live-controls label { font-weight: 700; }
+.live-controls input[type="text"] {
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+}
+.live-controls .hint a { color: var(--accent); }
+
+.ended-box {
+    margin-top: 12px;
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+}
+.ended-box p { margin: 0 0 8px; }

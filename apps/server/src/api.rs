@@ -3,23 +3,25 @@ use std::io;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path, State, multipart::MultipartError},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State, multipart::MultipartError},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{any, get},
 };
 use chrono::Utc;
 use futures_util::StreamExt;
+use serde::Deserialize;
 use serde_json::json;
 use shared::{
-    Broadcast, Recording, TITLE_MAX_CHARS, UPLOAD_POLICY_PATH, UploadPolicy, format_bytes,
-    registration_fields,
+    Broadcast, BroadcastStatus, LIVE_INGEST_PATH, Recording, TITLE_MAX_CHARS, UPLOAD_POLICY_PATH,
+    UploadPolicy, format_bytes, registration_fields,
 };
 use uuid::Uuid;
 
 use crate::{
     AppState,
     db::{self, InsertError, NewBroadcast, RecordingLocation},
+    live,
     range::{self, RangeRequest},
     storage::ByteRange,
 };
@@ -36,6 +38,8 @@ pub fn router() -> Router<AppState> {
         .route(UPLOAD_POLICY_PATH, get(upload_policy))
         .route("/api/broadcasts/{id}", get(get_broadcast))
         .route("/api/broadcasts/{id}/recording", get(play_recording))
+        .route("/api/broadcasts/{id}/live/{file}", get(live::serve_file))
+        .route(LIVE_INGEST_PATH, any(live::ingest))
         // 웹 정적 파일 대체 응답이 없는 API 경로를 가로채지 않도록 먼저 404로 답한다.
         .route("/api/{*rest}", any(unknown_api))
 }
@@ -44,8 +48,27 @@ async fn unknown_api() -> ApiError {
     ApiError::not_found("없는 API입니다.")
 }
 
-async fn list_broadcasts(State(state): State<AppState>) -> Result<Json<Vec<Broadcast>>, ApiError> {
-    Ok(Json(db::list_broadcasts(&state.db).await?))
+#[derive(Deserialize)]
+struct ListQuery {
+    status: Option<String>,
+}
+
+/// 방송 목록. `?status=live|ended`로 상태를 거를 수 있다.
+async fn list_broadcasts(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Vec<Broadcast>>, ApiError> {
+    let status = match query.status.as_deref() {
+        None => None,
+        Some(value) => Some(BroadcastStatus::parse(value).ok_or_else(|| {
+            ApiError::bad_request("방송 상태는 live 또는 ended만 쓸 수 있습니다.")
+        })?),
+    };
+    let mut broadcasts = db::list_broadcasts(&state.db, status).await?;
+    for broadcast in &mut broadcasts {
+        broadcast.live_playlist = live::has_playlist(&state, broadcast.id).await;
+    }
+    Ok(Json(broadcasts))
 }
 
 /// 지금 등록할 수 있는 녹화본 크기. 웹이 업로드 전에 확인한다.
@@ -65,7 +88,9 @@ async fn get_broadcast(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Broadcast>, ApiError> {
-    Ok(Json(find(&state, &id).await?.broadcast))
+    let mut broadcast = find(&state, &id).await?.broadcast;
+    broadcast.live_playlist = live::has_playlist(&state, broadcast.id).await;
+    Ok(Json(broadcast))
 }
 
 /// 방송 등록. multipart로 제목과 녹화본을 받는다.
@@ -104,7 +129,10 @@ async fn register_broadcast(
             id: new.id,
             title: new.title,
             created_at: new.created_at,
+            status: BroadcastStatus::Ended,
+            ended_at: Some(new.created_at),
             recording: Some(new.recording),
+            live_playlist: false,
         })
     }
     .await;
@@ -238,7 +266,7 @@ impl std::fmt::Display for LimitExceeded {
 
 impl std::error::Error for LimitExceeded {}
 
-fn validate_title(title: &str) -> Result<String, ApiError> {
+pub(crate) fn validate_title(title: &str) -> Result<String, ApiError> {
     let title = title.trim();
     if title.is_empty() {
         return Err(ApiError::bad_request("제목을 입력해 주세요."));
@@ -389,11 +417,16 @@ impl ApiError {
         }
     }
 
+    /// 사용자에게 보여 줄 메시지.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
     fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
 
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, message)
     }
 

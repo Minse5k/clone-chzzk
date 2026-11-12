@@ -3,6 +3,7 @@
 mod api;
 mod config;
 mod db;
+mod live;
 mod range;
 mod storage;
 
@@ -25,6 +26,7 @@ pub struct AppState {
     pub db: SqlitePool,
     pub store: Arc<RecordingStore>,
     pub config: Arc<Config>,
+    pub live: Arc<live::LiveCapacity>,
 }
 
 /// 설정으로 DB와 저장소를 준비하고 HTTP 라우터를 만든다.
@@ -37,11 +39,15 @@ pub async fn build_app(config: Config) -> anyhow::Result<Router> {
         Some(dir) => Some(web_service(dir)?),
         None => None,
     };
+    let live = live::LiveCapacity::check(&config).await;
     let state = AppState {
         db,
         store: Arc::new(store),
         config: Arc::new(config),
+        live: Arc::new(live),
     };
+    // 서버가 송출 도중에 멈췄다면 라이브 중으로 남은 방송을 정리한다.
+    live::recover(&state).await?;
 
     let mut router = api::router().with_state(state);
     if let Some(web) = web {
