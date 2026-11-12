@@ -120,6 +120,10 @@ pub fn show_preview(video_id: &str, stream: Option<&MediaStream>) {
         .and_then(|document| document.get_element_by_id(video_id))
         .and_then(|element| element.dyn_into::<HtmlVideoElement>().ok())
     {
+        // 송출자 자신의 마이크 소리가 스피커로 나오면 하울링이 생긴다.
+        // `muted` 속성(attribute)은 이미 만들어진 요소의 실제 음소거 상태를 바꾸지 못하므로
+        // 프로퍼티로 직접 끈다.
+        video.set_muted(true);
         video.set_src_object(stream);
     }
 }
