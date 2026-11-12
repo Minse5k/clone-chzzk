@@ -39,6 +39,7 @@ web-sys = { version = "0.3", features = [
     "MessageEvent",
     "Navigator",
     "RecordingState",
+    "Storage",
     "WebSocket",
     "BinaryType",
     "Window",

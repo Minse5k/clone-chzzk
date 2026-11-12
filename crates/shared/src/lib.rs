@@ -163,3 +163,41 @@ pub enum IngestServerMessage {
     /// 송출을 시작할 수 없다. 방송은 만들어지지 않았다.
     Error { message: String },
 }
+
+/// 로그인한 사용자. 방송 소유자와 댓글 작성자로도 쓰인다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct User {
+    pub id: Uuid,
+    /// 아이디. 화면에 보이는 이름으로도 쓴다.
+    pub username: String,
+}
+
+/// 회원가입·로그인 요청.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
+/// 회원가입·로그인 응답. 이후 요청의 `Authorization: Bearer {token}`에 쓴다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthResponse {
+    pub token: String,
+    pub user: User,
+}
+
+/// 아이디 길이(글자 수). 영문 소문자·숫자·밑줄만 쓸 수 있고, 대문자는 소문자로 바꿔 저장한다.
+pub const USERNAME_MIN_CHARS: usize = 3;
+pub const USERNAME_MAX_CHARS: usize = 20;
+/// 비밀번호 길이(글자 수).
+pub const PASSWORD_MIN_CHARS: usize = 8;
+pub const PASSWORD_MAX_CHARS: usize = 72;
+
+/// 회원가입 API 경로. 가입하면 바로 로그인된 토큰을 돌려준다.
+pub const SIGNUP_PATH: &str = "/api/auth/signup";
+/// 로그인 API 경로.
+pub const LOGIN_PATH: &str = "/api/auth/login";
+/// 로그아웃 API 경로. 요청에 쓴 토큰을 폐기한다.
+pub const LOGOUT_PATH: &str = "/api/auth/logout";
+/// 내 정보 API 경로. 토큰이 아직 유효한지 확인할 때도 쓴다.
+pub const ME_PATH: &str = "/api/auth/me";

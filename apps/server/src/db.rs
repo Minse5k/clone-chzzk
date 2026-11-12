@@ -275,3 +275,86 @@ pub async fn end_broadcast(
         .await?;
     Ok(())
 }
+
+/// 로그인할 때 확인하는 사용자 정보.
+pub struct StoredUser {
+    pub user: shared::User,
+    pub password_hash: String,
+}
+
+/// 새 사용자를 기록한다. 같은 아이디가 이미 있으면 `Ok(false)`.
+pub async fn insert_user(
+    pool: &SqlitePool,
+    user: &shared::User,
+    password_hash: &str,
+    created_at: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?) \
+         ON CONFLICT (username) DO NOTHING",
+    )
+    .bind(user.id.to_string())
+    .bind(&user.username)
+    .bind(password_hash)
+    .bind(format_time(created_at))
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn find_user_by_username(
+    pool: &SqlitePool,
+    username: &str,
+) -> anyhow::Result<Option<StoredUser>> {
+    let row: Option<(String, String, String)> =
+        sqlx::query_as("SELECT id, username, password_hash FROM users WHERE username = ?")
+            .bind(username)
+            .fetch_optional(pool)
+            .await?;
+    row.map(|(id, username, password_hash)| {
+        Ok(StoredUser {
+            user: shared::User {
+                id: Uuid::parse_str(&id)?,
+                username,
+            },
+            password_hash,
+        })
+    })
+    .transpose()
+}
+
+pub async fn find_user(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Option<shared::User>> {
+    let username: Option<String> = sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
+        .bind(id.to_string())
+        .fetch_optional(pool)
+        .await?;
+    Ok(username.map(|username| shared::User { id, username }))
+}
+
+/// 로그아웃한 토큰을 폐기 목록에 넣고, 만료가 지나 더는 필요 없는 항목을 정리한다.
+pub async fn revoke_token(
+    pool: &SqlitePool,
+    jti: &str,
+    expires_at: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("INSERT OR IGNORE INTO revoked_tokens (jti, expires_at) VALUES (?, ?)")
+        .bind(jti)
+        .bind(format_time(expires_at))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM revoked_tokens WHERE expires_at < ?")
+        .bind(format_time(Utc::now()))
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn is_token_revoked(pool: &SqlitePool, jti: &str) -> anyhow::Result<bool> {
+    let found: Option<i64> = sqlx::query_scalar("SELECT 1 FROM revoked_tokens WHERE jti = ?")
+        .bind(jti)
+        .fetch_optional(pool)
+        .await?;
+    Ok(found.is_some())
+}

@@ -17,6 +17,8 @@ use shared::{
     recording_path,
 };
 use tempfile::TempDir;
+
+const TEST_JWT_SECRET: &str = "test-only-jwt-secret";
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use tower::ServiceExt;
@@ -68,6 +70,8 @@ impl LiveServer {
             ffmpeg_path: "ffmpeg".into(),
             max_live_broadcasts: 2,
             live_idle_timeout: Duration::from_secs(20),
+            jwt_secret: Some(TEST_JWT_SECRET.into()),
+            jwt_ttl: std::time::Duration::from_secs(3600),
         }
     }
 

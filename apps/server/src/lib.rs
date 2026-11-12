@@ -1,6 +1,7 @@
 //! clone-chzzk API 서버.
 
 mod api;
+mod auth;
 mod config;
 mod db;
 mod live;
@@ -19,7 +20,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-pub use config::{Config, OciStorageConfig, StorageConfig, server_addr_from_env};
+pub use config::{Config, JwtSecret, OciStorageConfig, StorageConfig, server_addr_from_env};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -27,6 +28,7 @@ pub struct AppState {
     pub store: Arc<RecordingStore>,
     pub config: Arc<Config>,
     pub live: Arc<live::LiveCapacity>,
+    pub auth: Arc<auth::AuthKeys>,
 }
 
 /// 설정으로 DB와 저장소를 준비하고 HTTP 라우터를 만든다.
@@ -40,11 +42,13 @@ pub async fn build_app(config: Config) -> anyhow::Result<Router> {
         None => None,
     };
     let live = live::LiveCapacity::check(&config).await;
+    let auth = auth::AuthKeys::new(&config);
     let state = AppState {
         db,
         store: Arc::new(store),
         config: Arc::new(config),
         live: Arc::new(live),
+        auth: Arc::new(auth),
     };
     // 서버가 송출 도중에 멈췄다면 라이브 중으로 남은 방송을 정리한다.
     live::recover(&state).await?;

@@ -11,6 +11,8 @@ use shared::{
     Broadcast, BroadcastStatus, UPLOAD_POLICY_PATH, UploadPolicy, broadcasts_path, recording_path,
 };
 use tempfile::TempDir;
+
+const TEST_JWT_SECRET: &str = "test-only-jwt-secret";
 use tower::ServiceExt;
 
 /// 테스트마다 임시 SQLite 파일과 임시 local 저장소를 쓰는 서버.
@@ -102,6 +104,8 @@ impl TestServer {
             ffmpeg_path: "ffmpeg".into(),
             max_live_broadcasts: 2,
             live_idle_timeout: std::time::Duration::from_secs(20),
+            jwt_secret: Some(TEST_JWT_SECRET.into()),
+            jwt_ttl: std::time::Duration::from_secs(3600),
         }
     }
 
