@@ -233,3 +233,6 @@ a.hint { color: var(--accent); }
     background: var(--surface);
 }
 .ended-box p { margin: 0 0 8px; }
+
+.login-required { display: flex; flex-direction: column; gap: 4px; }
+.meta .owner { font-weight: 700; color: var(--text); }

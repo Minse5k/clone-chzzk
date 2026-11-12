@@ -9,6 +9,8 @@ use uuid::Uuid;
 pub struct Broadcast {
     pub id: Uuid,
     pub title: String,
+    /// 방송한 사용자. 이 사용자만 방송을 관리할 수 있다.
+    pub owner: User,
     /// 등록 시각. 라이브 방송은 송출을 시작한 시각이다.
     pub created_at: DateTime<Utc>,
     pub status: BroadcastStatus,
@@ -132,7 +134,7 @@ pub const LIVE_PLAYLIST_FILE: &str = "index.m3u8";
 
 /// 송출 WebSocket 경로.
 ///
-/// 송출자가 연결을 열고 [`IngestClientMessage::Start`]를 보내면 서버가 라이브 방송을 만들고
+/// 로그인한 송출자가 연결을 열고 토큰을 담은 [`IngestClientMessage::Start`]를 보내면 서버가 라이브 방송을 만들고
 /// [`IngestServerMessage::Started`]로 답한다. 이후 바이너리 메시지는 모두 브라우저
 /// MediaRecorder가 만든 녹화 조각이다. [`IngestClientMessage::End`]를 보내거나 연결이 끊기면
 /// 방송이 종료된다. 연결의 수명이 곧 라이브 방송의 수명이다.
@@ -144,6 +146,10 @@ pub const LIVE_INGEST_PATH: &str = "/api/live/ingest";
 pub enum IngestClientMessage {
     /// 송출 시작. 연결 후 첫 메시지여야 한다.
     Start {
+        /// 로그인 토큰. 브라우저 WebSocket은 헤더를 붙일 수 없어 메시지에 싣는다.
+        /// 송출한 사용자가 방송의 소유자가 된다.
+        #[serde(default)]
+        token: Option<String>,
         title: String,
         /// MediaRecorder 녹화 형식. 예: `video/webm;codecs=vp8,opus`, `video/mp4`.
         mime_type: String,

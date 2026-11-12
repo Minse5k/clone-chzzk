@@ -19,7 +19,8 @@ use shared::{
 use uuid::Uuid;
 
 use crate::{
-    AppState, auth,
+    AppState,
+    auth::{self, AuthUser},
     db::{self, InsertError, NewBroadcast, RecordingLocation},
     live,
     range::{self, RangeRequest},
@@ -94,10 +95,12 @@ async fn get_broadcast(
     Ok(Json(broadcast))
 }
 
-/// 방송 등록. multipart로 제목과 녹화본을 받는다.
+/// 방송 등록. 로그인한 사용자만 할 수 있고, 등록한 사용자가 소유자가 된다.
+/// multipart로 제목과 녹화본을 받는다.
 /// 녹화본을 저장소에 끝까지 저장한 뒤에 DB에 방송을 기록하고, 도중에 실패하면 저장한 녹화본을 지운다.
 async fn register_broadcast(
     State(state): State<AppState>,
+    AuthUser { user: owner, .. }: AuthUser,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<Broadcast>), ApiError> {
     let id = Uuid::now_v7();
@@ -110,6 +113,7 @@ async fn register_broadcast(
         let new = NewBroadcast {
             id,
             title,
+            owner_id: owner.id,
             created_at: Utc::now(),
             recording: Recording {
                 content_type: recording.content_type.into(),
@@ -129,6 +133,7 @@ async fn register_broadcast(
         Ok::<_, ApiError>(Broadcast {
             id: new.id,
             title: new.title,
+            owner,
             created_at: new.created_at,
             status: BroadcastStatus::Ended,
             ended_at: Some(new.created_at),

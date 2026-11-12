@@ -313,7 +313,10 @@ fn BroadcastSection(heading: String, empty: String, broadcasts: Vec<Broadcast>) 
                                 to: Route::BroadcastDetail { id: broadcast.id.to_string() },
                                 StatusBadge { status: broadcast.status }
                                 span { class: "title", "{broadcast.title}" }
-                                span { class: "meta", {format_time(broadcast.created_at)} }
+                                span { class: "meta",
+                                    "{broadcast.owner.username} · "
+                                    {format_time(broadcast.created_at)}
+                                }
                             }
                         }
                     }
@@ -385,6 +388,8 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
                     h1 { "{broadcast.title}" }
                 }
                 p { class: "meta",
+                    span { class: "owner", "{broadcast.owner.username}" }
+                    " · "
                     match broadcast.ended_at {
                         None => rsx! { "송출 시작 " {format_time(broadcast.created_at)} },
                         // 방송 등록으로 생긴 방송은 등록 시각에 이미 종료된 방송이다.
@@ -594,9 +599,36 @@ impl LivePhase {
     }
 }
 
-/// 휴대폰 카메라·마이크로 라이브 방송을 송출하는 화면.
+/// 라이브 송출 화면. 로그인한 사용자만 송출할 수 있다.
 #[component]
 fn LiveBroadcast() -> Element {
+    if session::current_user().is_none() {
+        return rsx! {
+            h1 { "라이브 송출" }
+            LoginRequired { action: "라이브 송출을 하려면" }
+        };
+    }
+    rsx! { LiveStudio {} }
+}
+
+/// 로그인이 필요한 화면에서 로그인을 안내한다. 로그인하면 지금 화면으로 돌아온다.
+#[component]
+fn LoginRequired(action: String) -> Element {
+    let route = use_route::<Route>();
+    rsx! {
+        div { class: "login-required",
+            p { class: "notice", "{action} 로그인이 필요합니다." }
+            div { class: "button-row",
+                Link { class: "button", to: Route::Login { next: route.to_string() }, "로그인" }
+                Link { class: "button secondary", to: Route::Signup { next: route.to_string() }, "회원가입" }
+            }
+        }
+    }
+}
+
+/// 휴대폰 카메라·마이크로 라이브 방송을 송출하는 화면.
+#[component]
+fn LiveStudio() -> Element {
     let mut title = use_signal(String::new);
     let mut camera = use_signal(|| None::<MediaStream>);
     let mut facing = use_signal(|| Facing::User);
@@ -655,7 +687,11 @@ fn LiveBroadcast() -> Element {
             return;
         }
         let (sender, mut events) = futures_channel::mpsc::unbounded();
-        match LiveSession::start(&stream, title().trim(), sender) {
+        let Some(token) = session::token() else {
+            error.set(Some("로그인이 필요합니다.".into()));
+            return;
+        };
+        match LiveSession::start(&stream, &token, title().trim(), sender) {
             Ok(started) => session.set(Some(started)),
             Err(message) => {
                 error.set(Some(message));
@@ -894,8 +930,20 @@ fn format_elapsed(millis: f64) -> String {
 
 const RECORDING_INPUT_ID: &str = "recording-file";
 
+/// 방송 등록 화면. 로그인한 사용자만 등록할 수 있다.
 #[component]
 fn BroadcastRegistration() -> Element {
+    if session::current_user().is_none() {
+        return rsx! {
+            h1 { "방송 등록" }
+            LoginRequired { action: "방송을 등록하려면" }
+        };
+    }
+    rsx! { RegistrationForm {} }
+}
+
+#[component]
+fn RegistrationForm() -> Element {
     let mut title = use_signal(String::new);
     let mut submitting = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);

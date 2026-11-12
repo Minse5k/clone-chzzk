@@ -52,12 +52,30 @@ pub async fn build_app(config: Config) -> anyhow::Result<Router> {
     };
     // 서버가 송출 도중에 멈췄다면 라이브 중으로 남은 방송을 정리한다.
     live::recover(&state).await?;
+    purge_pending_deletions(&state).await?;
 
     let mut router = api::router().with_state(state);
     if let Some(web) = web {
         router = router.fallback_service(web);
     }
     Ok(router.layer(cors).layer(TraceLayer::new_for_http()))
+}
+
+/// 삭제 대기열의 녹화본 객체를 저장소에서 지운다. 지우지 못한 객체는 다음 시작 때 다시 시도한다.
+async fn purge_pending_deletions(state: &AppState) -> anyhow::Result<()> {
+    let backend = state.store.backend_name();
+    for key in db::pending_deletions(&state.db, backend).await? {
+        match state.store.delete(&key).await {
+            Ok(()) => {
+                db::remove_pending_deletion(&state.db, backend, &key).await?;
+                tracing::info!("삭제된 방송의 녹화본을 지웠습니다: {key}");
+            }
+            Err(err) => {
+                tracing::warn!("녹화본 {key}을 지우지 못해 다음 시작 때 다시 시도합니다: {err:#}")
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 빌드된 웹 정적 파일. 파일이 없는 경로는 웹 진입 HTML로 답해,

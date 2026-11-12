@@ -49,6 +49,7 @@ pub struct StoredBroadcast {
 pub struct NewBroadcast {
     pub id: Uuid,
     pub title: String,
+    pub owner_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub recording: Recording,
     pub recording_location: RecordingLocation,
@@ -58,6 +59,8 @@ pub struct NewBroadcast {
 struct BroadcastRow {
     id: String,
     title: String,
+    owner_id: String,
+    owner_username: String,
     created_at: String,
     ended_at: Option<String>,
     storage_backend: Option<String>,
@@ -93,6 +96,10 @@ impl TryFrom<BroadcastRow> for StoredBroadcast {
             broadcast: Broadcast {
                 id: Uuid::parse_str(&row.id)?,
                 title: row.title,
+                owner: shared::User {
+                    id: Uuid::parse_str(&row.owner_id)?,
+                    username: row.owner_username,
+                },
                 created_at: parse_time(&row.created_at)?,
                 status: BroadcastStatus::from_ended_at(ended_at),
                 ended_at,
@@ -114,9 +121,11 @@ fn format_time(time: DateTime<Utc>) -> String {
 }
 
 const SELECT_BROADCASTS: &str = "\
-    SELECT b.id, b.title, b.created_at, b.ended_at, \
+    SELECT b.id, b.title, b.owner_id, u.username AS owner_username, b.created_at, b.ended_at, \
            r.storage_backend, r.object_key, r.content_type, r.size_bytes \
-    FROM broadcasts b LEFT JOIN recordings r ON r.broadcast_id = b.id";
+    FROM broadcasts b \
+    JOIN users u ON u.id = b.owner_id \
+    LEFT JOIN recordings r ON r.broadcast_id = b.id";
 
 /// 방송 목록, 최신 등록순. 상태를 주면 그 상태의 방송만 돌려준다.
 pub async fn list_broadcasts(
@@ -184,13 +193,16 @@ pub async fn insert_broadcast(
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     check_quota(&mut tx, new.recording.size_bytes, storage_quota_bytes).await?;
     let created_at = format_time(new.created_at);
-    sqlx::query("INSERT INTO broadcasts (id, title, created_at, ended_at) VALUES (?, ?, ?, ?)")
-        .bind(new.id.to_string())
-        .bind(&new.title)
-        .bind(&created_at)
-        .bind(&created_at)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO broadcasts (id, title, owner_id, created_at, ended_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(new.id.to_string())
+    .bind(&new.title)
+    .bind(new.owner_id.to_string())
+    .bind(&created_at)
+    .bind(&created_at)
+    .execute(&mut *tx)
+    .await?;
     insert_recording_row(&mut tx, new.id, &new.recording, &new.recording_location).await?;
     tx.commit().await?;
     Ok(())
@@ -251,11 +263,13 @@ pub async fn insert_live_broadcast(
     pool: &SqlitePool,
     id: Uuid,
     title: &str,
+    owner_id: Uuid,
     started_at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO broadcasts (id, title, created_at) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO broadcasts (id, title, owner_id, created_at) VALUES (?, ?, ?, ?)")
         .bind(id.to_string())
         .bind(title)
+        .bind(owner_id.to_string())
         .bind(format_time(started_at))
         .execute(pool)
         .await?;
@@ -357,4 +371,30 @@ pub async fn is_token_revoked(pool: &SqlitePool, jti: &str) -> anyhow::Result<bo
         .fetch_optional(pool)
         .await?;
     Ok(found.is_some())
+}
+
+/// 지워야 할 녹화본 객체 중 이 저장소에 있는 것들의 키.
+pub async fn pending_deletions(pool: &SqlitePool, backend: &str) -> anyhow::Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT object_key FROM pending_object_deletions WHERE storage_backend = ?",
+    )
+    .bind(backend)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// 저장소에서 지운 객체를 삭제 대기열에서 뺀다.
+pub async fn remove_pending_deletion(
+    pool: &SqlitePool,
+    backend: &str,
+    object_key: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "DELETE FROM pending_object_deletions WHERE storage_backend = ? AND object_key = ?",
+    )
+    .bind(backend)
+    .bind(object_key)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
