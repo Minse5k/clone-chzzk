@@ -25,6 +25,26 @@ pub struct Config {
     pub max_live_broadcasts: usize,
     /// 송출 중에 녹화 조각이 이 시간 동안 오지 않으면 방송을 종료한다.
     pub live_idle_timeout: Duration,
+    /// 로그인 토큰(JWT)의 서명 키. 비우면 서버를 시작할 때마다 임시 키를 만든다(재시작하면 모두 로그아웃).
+    pub jwt_secret: Option<JwtSecret>,
+    /// 로그인 토큰의 유효 시간.
+    pub jwt_ttl: Duration,
+}
+
+/// 로그인 토큰 서명 키. 로그나 디버그 출력에 값이 드러나지 않게 감싼다.
+#[derive(Clone)]
+pub struct JwtSecret(pub String);
+
+impl std::fmt::Debug for JwtSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JwtSecret(<숨김>)")
+    }
+}
+
+impl From<&str> for JwtSecret {
+    fn from(secret: &str) -> Self {
+        Self(secret.to_owned())
+    }
 }
 
 /// 녹화본 저장소 백엔드. `STORAGE_BACKEND`로 고른다(기본 `local`).
@@ -119,6 +139,12 @@ impl Config {
             ffmpeg_path: env_or("FFMPEG_PATH", "ffmpeg").into(),
             max_live_broadcasts: env_number("MAX_LIVE_BROADCASTS", 2)?,
             live_idle_timeout: Duration::from_secs(env_number("LIVE_IDLE_TIMEOUT_SECS", 20)?),
+            jwt_secret: env::var("JWT_SECRET")
+                .ok()
+                .map(|secret| secret.trim().to_owned())
+                .filter(|secret| !secret.is_empty())
+                .map(JwtSecret),
+            jwt_ttl: Duration::from_secs(env_number("JWT_TTL_SECS", 24 * 60 * 60)?),
         })
     }
 }

@@ -2,9 +2,10 @@
 //! 설계 근거는 ADR 0003.
 
 use std::{
+    collections::HashMap,
     path::{Path as FsPath, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -20,12 +21,12 @@ use axum::{
 use chrono::Utc;
 use shared::{
     Broadcast, BroadcastStatus, IngestClientMessage, IngestServerMessage, LIVE_PLAYLIST_FILE,
-    Recording, format_bytes,
+    Recording, User, format_bytes,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, Semaphore, oneshot},
 };
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -33,6 +34,7 @@ use uuid::Uuid;
 use crate::{
     AppState, Config,
     api::{ApiError, validate_title},
+    auth,
     db::{self, InsertError, RecordingLocation},
 };
 
@@ -50,11 +52,11 @@ pub async fn ingest(State(state): State<AppState>, ws: WebSocketUpgrade) -> Resp
 }
 
 async fn run_ingest(state: AppState, mut socket: WebSocket) {
-    let title = match receive_start(&mut socket).await {
-        Ok(title) => title,
+    let (title, owner) = match receive_start(&state, &mut socket).await {
+        Ok(started) => started,
         Err(message) => return reject(socket, message).await,
     };
-    let (_slot, limit) = match admit(&state).await {
+    let (slot, limit) = match admit(&state).await {
         Ok(admitted) => admitted,
         Err(message) => return reject(socket, message).await,
     };
@@ -74,7 +76,7 @@ async fn run_ingest(state: AppState, mut socket: WebSocket) {
         }
     };
     let started_at = Utc::now();
-    if let Err(err) = db::insert_live_broadcast(&state.db, id, &title, started_at).await {
+    if let Err(err) = db::insert_live_broadcast(&state.db, id, &title, owner.id, started_at).await {
         tracing::error!(broadcast = %id, "라이브 방송을 기록할 수 없습니다: {err:#}");
         encoder.finish().await;
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -85,10 +87,12 @@ async fn run_ingest(state: AppState, mut socket: WebSocket) {
         .await;
     }
     tracing::info!(broadcast = %id, "송출 시작: {title}");
+    let (registration, mut stop) = state.live.register(id);
 
     let broadcast = Broadcast {
         id,
         title,
+        owner,
         created_at: started_at,
         status: BroadcastStatus::Live,
         ended_at: None,
@@ -100,16 +104,20 @@ async fn run_ingest(state: AppState, mut socket: WebSocket) {
     let reason = relay(
         &mut socket,
         &mut encoder,
+        &mut stop,
         limit,
         state.config.live_idle_timeout,
     )
     .await;
+    drop(registration);
 
     // 상태를 먼저 종료로 바꿔, 마무리하는 동안에도 시청자가 라이브로 착각하지 않게 한다.
     if let Err(err) = db::end_broadcast(&state.db, id, Utc::now()).await {
         tracing::error!(broadcast = %id, "방송을 종료로 기록할 수 없습니다: {err:#}");
     }
     encoder.finish().await;
+    // 인코딩이 끝났으니 동시 라이브 자리를 돌려준다. 송출자가 종료 응답을 받으면 바로 다시 시작할 수 있다.
+    drop(slot);
     tracing::info!(broadcast = %id, "송출 종료");
 
     send(&mut socket, &IngestServerMessage::Ended { reason }).await;
@@ -201,6 +209,47 @@ pub struct LiveCapacity {
     ffmpeg_available: bool,
     max_live_broadcasts: usize,
     slots: Arc<Semaphore>,
+    /// 진행 중인 송출 연결에 종료를 알리는 신호. 소유자가 다른 기기에서 방송을 끝낼 때 쓴다.
+    stops: Mutex<HashMap<Uuid, oneshot::Sender<()>>>,
+}
+
+/// 소유자가 다른 기기에서 방송을 끝냈을 때 송출자에게 보여 주는 이유.
+pub const STOPPED_BY_OWNER: &str = "소유자가 다른 기기에서 방송을 종료했습니다.";
+
+impl LiveCapacity {
+    /// 진행 중인 송출 연결에 종료를 알린다. 그 방송을 송출하는 연결이 없으면 `false`.
+    pub fn request_stop(&self, id: Uuid) -> bool {
+        let sender = self.stops.lock().expect("송출 종료 신호 잠금").remove(&id);
+        sender.is_some_and(|sender| sender.send(()).is_ok())
+    }
+
+    /// 송출 연결을 종료 신호 대상으로 등록한다. 돌려준 값이 사라지면 등록이 풀린다.
+    fn register(self: &Arc<Self>, id: Uuid) -> (StopRegistration, oneshot::Receiver<()>) {
+        let (sender, receiver) = oneshot::channel();
+        self.stops
+            .lock()
+            .expect("송출 종료 신호 잠금")
+            .insert(id, sender);
+        let registration = StopRegistration {
+            live: Arc::clone(self),
+            id,
+        };
+        (registration, receiver)
+    }
+}
+
+/// 송출이 끝나면 종료 신호 등록을 푼다.
+struct StopRegistration {
+    live: Arc<LiveCapacity>,
+    id: Uuid,
+}
+
+impl Drop for StopRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut stops) = self.live.stops.lock() {
+            stops.remove(&self.id);
+        }
+    }
 }
 
 impl LiveCapacity {
@@ -224,6 +273,7 @@ impl LiveCapacity {
             ffmpeg_available,
             max_live_broadcasts: config.max_live_broadcasts,
             slots: Arc::new(Semaphore::new(config.max_live_broadcasts)),
+            stops: Mutex::default(),
         }
     }
 }
@@ -290,8 +340,9 @@ pub async fn recover(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 첫 메시지로 송출 시작을 받아 검증한 제목을 돌려준다.
-async fn receive_start(socket: &mut WebSocket) -> Result<String, String> {
+/// 첫 메시지로 송출 시작을 받아 검증한 제목과 송출한 사용자(소유자)를 돌려준다.
+/// 로그인하지 않았거나 토큰이 잘못되었으면 방송을 만들기 전에 거절한다.
+async fn receive_start(state: &AppState, socket: &mut WebSocket) -> Result<(String, User), String> {
     let message = tokio::time::timeout(START_TIMEOUT, socket.recv())
         .await
         .map_err(|_| "송출 시작 요청이 오지 않았습니다.".to_owned())?;
@@ -299,9 +350,21 @@ async fn receive_start(socket: &mut WebSocket) -> Result<String, String> {
         return Err("송출 시작 요청을 먼저 보내야 합니다.".into());
     };
     match serde_json::from_str(&text) {
-        Ok(IngestClientMessage::Start { title, mime_type }) => {
+        Ok(IngestClientMessage::Start {
+            token,
+            title,
+            mime_type,
+        }) => {
             tracing::debug!("송출 녹화 형식: {mime_type}");
-            validate_title(&title).map_err(|err| err.message().to_owned())
+            let token = token
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| auth::login_required().message().to_owned())?;
+            let owner = auth::authenticate(state, &token)
+                .await
+                .map_err(|err| err.message().to_owned())?
+                .user;
+            let title = validate_title(&title).map_err(|err| err.message().to_owned())?;
+            Ok((title, owner))
         }
         _ => Err("송출 시작 요청을 먼저 보내야 합니다.".into()),
     }
@@ -312,12 +375,17 @@ async fn receive_start(socket: &mut WebSocket) -> Result<String, String> {
 async fn relay(
     socket: &mut WebSocket,
     encoder: &mut HlsEncoder,
+    stop: &mut oneshot::Receiver<()>,
     limit: ReceiveLimit,
     idle_timeout: Duration,
 ) -> Option<String> {
     let mut received: u64 = 0;
     loop {
-        let Ok(message) = tokio::time::timeout(idle_timeout, socket.recv()).await else {
+        let message = tokio::select! {
+            message = tokio::time::timeout(idle_timeout, socket.recv()) => message,
+            Ok(()) = &mut *stop => return Some(STOPPED_BY_OWNER.into()),
+        };
+        let Ok(message) = message else {
             return Some(format!(
                 "{}초 동안 영상이 오지 않아 방송을 종료했습니다.",
                 idle_timeout.as_secs()

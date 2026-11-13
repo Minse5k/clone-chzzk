@@ -1,14 +1,19 @@
 //! clone-chzzk 웹 앱.
 
 mod api;
+mod comments;
 mod live;
+mod session;
 
 use chrono::{DateTime, Local, Utc};
 use dioxus::prelude::*;
 use futures_util::StreamExt;
 use gloo_timers::future::TimeoutFuture;
 use live::{Facing, LiveEvent, LiveSession};
-use shared::{Broadcast, BroadcastStatus, TITLE_MAX_CHARS, UploadPolicy, format_bytes};
+use shared::{
+    Broadcast, BroadcastStatus, PASSWORD_MAX_CHARS, PASSWORD_MIN_CHARS, TITLE_MAX_CHARS,
+    USERNAME_MAX_CHARS, USERNAME_MIN_CHARS, UploadPolicy, format_bytes,
+};
 use uuid::Uuid;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlInputElement;
@@ -29,6 +34,10 @@ enum Route {
     LiveBroadcast {},
     #[route("/broadcasts/:id")]
     BroadcastDetail { id: String },
+    #[route("/login?:next")]
+    Login { next: String },
+    #[route("/signup?:next")]
+    Signup { next: String },
     #[route("/:..segments")]
     PageNotFound { segments: Vec<String> },
 }
@@ -48,15 +57,212 @@ fn App() -> Element {
 
 #[component]
 fn Shell() -> Element {
+    // 저장해 둔 토큰이 아직 유효한지 확인한다. 만료·폐기되었으면(401) 로그아웃 상태가 된다.
+    use_future(|| async {
+        if session::token().is_some()
+            && let Ok(user) = api::me().await
+            && let Some(current) = session::SESSION.write().as_mut()
+        {
+            current.user = user;
+        }
+    });
+
     rsx! {
         header { class: "topbar",
             Link { class: "brand", to: Route::BroadcastList {}, "clone-chzzk" }
             nav { class: "actions",
                 Link { class: "button live", to: Route::LiveBroadcast {}, "라이브 송출" }
                 Link { class: "button", to: Route::BroadcastRegistration {}, "방송 등록" }
+                AccountMenu {}
             }
         }
         main { class: "page", Outlet::<Route> {} }
+    }
+}
+
+/// 상단의 로그인 상태. 로그인했으면 아이디와 로그아웃, 아니면 로그인·회원가입 링크.
+#[component]
+fn AccountMenu() -> Element {
+    let navigator = use_navigator();
+    let route = use_route::<Route>();
+    let logout = move |_| async move {
+        // 서버가 토큰을 폐기하지 못해도(연결 끊김 등) 이 브라우저에서는 로그아웃한다.
+        if let Err(message) = api::logout().await {
+            dioxus::logger::tracing::warn!("로그아웃 요청 실패: {message}");
+        }
+        session::sign_out();
+        navigator.push(Route::BroadcastList {});
+    };
+
+    match session::current_user() {
+        Some(user) => rsx! {
+            span { class: "account", "{user.username}" }
+            button { class: "secondary", onclick: logout, "로그아웃" }
+        },
+        None => {
+            // 로그인 화면에서 다시 로그인 링크를 누르면 원래 가려던 곳을 그대로 둔다.
+            let next = match &route {
+                Route::Login { next } | Route::Signup { next } => next.clone(),
+                other => other.to_string(),
+            };
+            rsx! {
+                Link { class: "button secondary", to: Route::Login { next: next.clone() }, "로그인" }
+                Link { class: "button secondary", to: Route::Signup { next }, "회원가입" }
+            }
+        }
+    }
+}
+
+#[component]
+fn Login(next: String) -> Element {
+    rsx! { AuthForm { mode: AuthMode::Login, next } }
+}
+
+#[component]
+fn Signup(next: String) -> Element {
+    rsx! { AuthForm { mode: AuthMode::Signup, next } }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AuthMode {
+    Login,
+    Signup,
+}
+
+/// 로그인·회원가입 화면. 성공하면 `next`(원래 가려던 화면)로 간다.
+#[component]
+fn AuthForm(mode: AuthMode, next: String) -> Element {
+    let mut username = use_signal(String::new);
+    let mut password = use_signal(String::new);
+    let mut submitting = use_signal(|| false);
+    let mut error = use_signal(|| None::<String>);
+    let navigator = use_navigator();
+    let next = use_signal(|| next);
+
+    let submit = move |event: FormEvent| async move {
+        event.prevent_default();
+        if submitting() {
+            return;
+        }
+        let credentials = shared::Credentials {
+            username: username().trim().to_owned(),
+            password: password(),
+        };
+        if let Err(message) = check_credentials(mode, &credentials) {
+            error.set(Some(message));
+            return;
+        }
+        submitting.set(true);
+        error.set(None);
+        let result = match mode {
+            AuthMode::Login => api::login(&credentials).await,
+            AuthMode::Signup => api::signup(&credentials).await,
+        };
+        submitting.set(false);
+        match result {
+            Ok(auth) => {
+                session::sign_in(session::Session {
+                    token: auth.token,
+                    user: auth.user,
+                });
+                go_next(navigator, &next());
+            }
+            Err(message) => error.set(Some(message)),
+        }
+    };
+
+    let (heading, button, switch_text, switch_to) = match mode {
+        AuthMode::Login => (
+            "로그인",
+            "로그인",
+            "계정이 없나요? 회원가입",
+            Route::Signup { next: next() },
+        ),
+        AuthMode::Signup => (
+            "회원가입",
+            "가입하기",
+            "이미 계정이 있나요? 로그인",
+            Route::Login { next: next() },
+        ),
+    };
+
+    rsx! {
+        h1 { "{heading}" }
+        if let Some(user) = session::current_user() {
+            p { class: "notice", "{user.username}(으)로 로그인되어 있습니다." }
+        }
+        form { class: "registration-form", onsubmit: submit,
+            label { r#for: "username", "아이디" }
+            input {
+                id: "username",
+                r#type: "text",
+                autocomplete: "username",
+                autocapitalize: "none",
+                maxlength: USERNAME_MAX_CHARS as i64,
+                placeholder: "영문 소문자, 숫자, 밑줄 {USERNAME_MIN_CHARS}~{USERNAME_MAX_CHARS}자",
+                value: "{username}",
+                disabled: submitting(),
+                oninput: move |event| username.set(event.value()),
+            }
+            label { r#for: "password", "비밀번호" }
+            input {
+                id: "password",
+                r#type: "password",
+                autocomplete: if mode == AuthMode::Login { "current-password" } else { "new-password" },
+                maxlength: PASSWORD_MAX_CHARS as i64,
+                placeholder: "{PASSWORD_MIN_CHARS}~{PASSWORD_MAX_CHARS}자",
+                value: "{password}",
+                disabled: submitting(),
+                oninput: move |event| password.set(event.value()),
+            }
+            if let Some(message) = error() {
+                p { class: "notice error", role: "alert", "{message}" }
+            }
+            button { r#type: "submit", disabled: submitting(),
+                if submitting() { "처리 중…" } else { "{button}" }
+            }
+            Link { class: "hint", to: switch_to, "{switch_text}" }
+        }
+    }
+}
+
+/// 서버에 보내기 전에 걸러낼 수 있는 입력 오류. 문구는 서버와 같다.
+fn check_credentials(mode: AuthMode, credentials: &shared::Credentials) -> Result<(), String> {
+    if credentials.username.is_empty() || credentials.password.is_empty() {
+        return Err("아이디와 비밀번호를 입력해 주세요.".into());
+    }
+    if mode == AuthMode::Login {
+        return Ok(());
+    }
+    let username = credentials.username.to_lowercase();
+    let length = username.chars().count();
+    if !(USERNAME_MIN_CHARS..=USERNAME_MAX_CHARS).contains(&length)
+        || !username
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err(format!(
+            "아이디는 {USERNAME_MIN_CHARS}~{USERNAME_MAX_CHARS}자의 영문 소문자, 숫자, 밑줄(_)만 쓸 수 있습니다."
+        ));
+    }
+    let length = credentials.password.chars().count();
+    if !(PASSWORD_MIN_CHARS..=PASSWORD_MAX_CHARS).contains(&length) {
+        return Err(format!(
+            "비밀번호는 {PASSWORD_MIN_CHARS}~{PASSWORD_MAX_CHARS}자로 입력해 주세요."
+        ));
+    }
+    Ok(())
+}
+
+/// 로그인 후 원래 가려던 화면으로 간다. 이 사이트 안의 경로만 따른다.
+fn go_next(navigator: dioxus::router::Navigator, next: &str) {
+    match next.parse::<Route>() {
+        Ok(route) if next.starts_with('/') && !next.starts_with("//") => {
+            navigator.replace(route);
+        }
+        _ => {
+            navigator.replace(Route::BroadcastList {});
+        }
     }
 }
 
@@ -108,7 +314,10 @@ fn BroadcastSection(heading: String, empty: String, broadcasts: Vec<Broadcast>) 
                                 to: Route::BroadcastDetail { id: broadcast.id.to_string() },
                                 StatusBadge { status: broadcast.status }
                                 span { class: "title", "{broadcast.title}" }
-                                span { class: "meta", {format_time(broadcast.created_at)} }
+                                span { class: "meta",
+                                    "{broadcast.owner.username} · "
+                                    {format_time(broadcast.created_at)}
+                                }
                             }
                         }
                     }
@@ -147,6 +356,9 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
         }
     });
 
+    // 아래에서 방송 값이 같은 이름을 가리므로, 관리 후 다시 불러올 때 쓸 핸들을 따로 둔다.
+    let mut reload = broadcast;
+
     match &*broadcast.read() {
         None => rsx! { p { class: "notice", "불러오는 중…" } },
         Some(Err(message)) => rsx! { p { class: "notice error", "{message}" } },
@@ -180,6 +392,8 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
                     h1 { "{broadcast.title}" }
                 }
                 p { class: "meta",
+                    span { class: "owner", "{broadcast.owner.username}" }
+                    " · "
                     match broadcast.ended_at {
                         None => rsx! { "송출 시작 " {format_time(broadcast.created_at)} },
                         // 방송 등록으로 생긴 방송은 등록 시각에 이미 종료된 방송이다.
@@ -192,9 +406,136 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
                     }
                 }
                 ShareUrl { id: broadcast.id.to_string() }
+                OwnerControls {
+                    broadcast: broadcast.clone(),
+                    on_changed: move |_| reload.restart(),
+                }
+                comments::CommentSection { key: "{broadcast.id}", broadcast_id: broadcast.id }
             }
         },
     }
+}
+
+/// 소유자에게만 보이는 방송 관리(제목 수정, 라이브 종료, 삭제).
+/// 버튼은 소유자에게만 보이지만, 권한은 서버가 다시 확인하고 거절하면 그 이유를 보여 준다.
+#[component]
+fn OwnerControls(broadcast: Broadcast, on_changed: EventHandler<()>) -> Element {
+    let mut editing = use_signal(|| false);
+    let mut new_title = use_signal(String::new);
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| None::<String>);
+    let navigator = use_navigator();
+
+    let is_owner = session::current_user().is_some_and(|user| user.id == broadcast.owner.id);
+    if !is_owner {
+        return rsx! {};
+    }
+    let id = broadcast.id;
+    let live = broadcast.status == BroadcastStatus::Live;
+    let current_title = broadcast.title.clone();
+
+    let save_title = move |event: FormEvent| async move {
+        event.prevent_default();
+        busy.set(true);
+        match api::update_broadcast(id, &new_title()).await {
+            Ok(_) => {
+                editing.set(false);
+                error.set(None);
+                on_changed.call(());
+            }
+            Err(message) => error.set(Some(message)),
+        }
+        busy.set(false);
+    };
+
+    let end_live = move |_| async move {
+        if !confirm("라이브 방송을 종료할까요? 송출 중인 기기의 송출도 끝납니다.")
+        {
+            return;
+        }
+        busy.set(true);
+        match api::end_broadcast(id).await {
+            Ok(_) => {
+                error.set(None);
+                on_changed.call(());
+            }
+            Err(message) => error.set(Some(message)),
+        }
+        busy.set(false);
+    };
+
+    let delete = move |_| async move {
+        if !confirm("방송을 삭제할까요? 녹화본과 댓글도 함께 지워지며 되돌릴 수 없습니다.")
+        {
+            return;
+        }
+        busy.set(true);
+        match api::delete_broadcast(id).await {
+            Ok(()) => {
+                navigator.replace(Route::BroadcastList {});
+            }
+            Err(message) => {
+                error.set(Some(message));
+                busy.set(false);
+            }
+        }
+    };
+
+    rsx! {
+        section { class: "owner-controls",
+            h2 { "방송 관리" }
+            if editing() {
+                form { class: "title-edit", onsubmit: save_title,
+                    input {
+                        r#type: "text",
+                        "aria-label": "새 제목",
+                        maxlength: TITLE_MAX_CHARS as i64,
+                        value: "{new_title}",
+                        disabled: busy(),
+                        oninput: move |event| new_title.set(event.value()),
+                    }
+                    button { r#type: "submit", disabled: busy(), "저장" }
+                    button {
+                        r#type: "button",
+                        class: "secondary",
+                        disabled: busy(),
+                        onclick: move |_| {
+                            editing.set(false);
+                            error.set(None);
+                        },
+                        "취소"
+                    }
+                }
+            } else {
+                div { class: "button-row",
+                    button {
+                        class: "secondary",
+                        disabled: busy(),
+                        onclick: move |_| {
+                            new_title.set(current_title.clone());
+                            editing.set(true);
+                        },
+                        "제목 수정"
+                    }
+                    if live {
+                        button { class: "danger", disabled: busy(), onclick: end_live, "라이브 종료" }
+                    } else {
+                        button { class: "danger", disabled: busy(), onclick: delete, "방송 삭제" }
+                    }
+                }
+            }
+            if let Some(message) = error() {
+                p { class: "notice error", role: "alert", "{message}" }
+            }
+        }
+    }
+}
+
+/// 브라우저 확인 창. 열 수 없으면 진행하지 않는다.
+fn confirm(message: &str) -> bool {
+    web_sys::window()
+        .and_then(|window| window.confirm_with_message(message).ok())
+        .unwrap_or(false)
 }
 
 /// 다시 불러오면 바뀔 수 있는 방송: 라이브 중이거나, 끝났지만 녹화본을 아직 만드는 중이다.
@@ -389,9 +730,36 @@ impl LivePhase {
     }
 }
 
-/// 휴대폰 카메라·마이크로 라이브 방송을 송출하는 화면.
+/// 라이브 송출 화면. 로그인한 사용자만 송출할 수 있다.
 #[component]
 fn LiveBroadcast() -> Element {
+    if session::current_user().is_none() {
+        return rsx! {
+            h1 { "라이브 송출" }
+            LoginRequired { action: "라이브 송출을 하려면" }
+        };
+    }
+    rsx! { LiveStudio {} }
+}
+
+/// 로그인이 필요한 화면에서 로그인을 안내한다. 로그인하면 지금 화면으로 돌아온다.
+#[component]
+fn LoginRequired(action: String) -> Element {
+    let route = use_route::<Route>();
+    rsx! {
+        div { class: "login-required",
+            p { class: "notice", "{action} 로그인이 필요합니다." }
+            div { class: "button-row",
+                Link { class: "button", to: Route::Login { next: route.to_string() }, "로그인" }
+                Link { class: "button secondary", to: Route::Signup { next: route.to_string() }, "회원가입" }
+            }
+        }
+    }
+}
+
+/// 휴대폰 카메라·마이크로 라이브 방송을 송출하는 화면.
+#[component]
+fn LiveStudio() -> Element {
     let mut title = use_signal(String::new);
     let mut camera = use_signal(|| None::<MediaStream>);
     let mut facing = use_signal(|| Facing::User);
@@ -450,7 +818,11 @@ fn LiveBroadcast() -> Element {
             return;
         }
         let (sender, mut events) = futures_channel::mpsc::unbounded();
-        match LiveSession::start(&stream, title().trim(), sender) {
+        let Some(token) = session::token() else {
+            error.set(Some("로그인이 필요합니다.".into()));
+            return;
+        };
+        match LiveSession::start(&stream, &token, title().trim(), sender) {
             Ok(started) => session.set(Some(started)),
             Err(message) => {
                 error.set(Some(message));
@@ -689,8 +1061,20 @@ fn format_elapsed(millis: f64) -> String {
 
 const RECORDING_INPUT_ID: &str = "recording-file";
 
+/// 방송 등록 화면. 로그인한 사용자만 등록할 수 있다.
 #[component]
 fn BroadcastRegistration() -> Element {
+    if session::current_user().is_none() {
+        return rsx! {
+            h1 { "방송 등록" }
+            LoginRequired { action: "방송을 등록하려면" }
+        };
+    }
+    rsx! { RegistrationForm {} }
+}
+
+#[component]
+fn RegistrationForm() -> Element {
     let mut title = use_signal(String::new);
     let mut submitting = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);

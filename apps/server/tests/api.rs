@@ -8,9 +8,12 @@ use axum::{
 use http_body_util::BodyExt;
 use serde_json::Value;
 use shared::{
-    Broadcast, BroadcastStatus, UPLOAD_POLICY_PATH, UploadPolicy, broadcasts_path, recording_path,
+    AuthResponse, Broadcast, BroadcastStatus, SIGNUP_PATH, UPLOAD_POLICY_PATH, UploadPolicy, User,
+    broadcast_end_path, broadcasts_path, recording_path,
 };
 use tempfile::TempDir;
+
+const TEST_JWT_SECRET: &str = "test-only-jwt-secret";
 use tower::ServiceExt;
 
 /// 테스트마다 임시 SQLite 파일과 임시 local 저장소를 쓰는 서버.
@@ -18,6 +21,8 @@ struct TestServer {
     dir: TempDir,
     limits: Limits,
     app: Router,
+    /// 기본 사용자(방송 소유자). 테스트를 시작할 때 가입한다.
+    owner: AuthResponse,
 }
 
 /// 테스트 서버의 업로드 한도.
@@ -77,15 +82,55 @@ impl TestServer {
     async fn with_limits(limits: Limits) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let app = server::build_app(Self::config(&dir, limits)).await.unwrap();
-        Self { dir, limits, app }
+        Self::with_app(dir, limits, app).await
     }
 
-    /// 같은 DB 파일과 저장소로 서버를 다시 띄운다.
+    /// 띄운 서버에 기본 사용자를 가입시킨다.
+    async fn with_app(dir: TempDir, limits: Limits, app: Router) -> Self {
+        let mut server = Self {
+            dir,
+            limits,
+            app,
+            owner: AuthResponse {
+                token: String::new(),
+                user: User {
+                    id: uuid::Uuid::nil(),
+                    username: String::new(),
+                },
+            },
+        };
+        server.owner = server.signup("owner").await;
+        server
+    }
+
+    /// 같은 DB 파일과 저장소로 서버를 다시 띄운다. 기본 사용자와 토큰은 그대로 쓴다.
     async fn restart(self) -> Self {
-        let Self { dir, limits, app } = self;
+        let Self {
+            dir,
+            limits,
+            app,
+            owner,
+        } = self;
         drop(app);
         let app = server::build_app(Self::config(&dir, limits)).await.unwrap();
-        Self { dir, limits, app }
+        Self {
+            dir,
+            limits,
+            app,
+            owner,
+        }
+    }
+
+    /// 사용자를 가입시키고 로그인 정보를 돌려준다. 비밀번호는 모두 `password123`.
+    async fn signup(&self, username: &str) -> AuthResponse {
+        let body = serde_json::json!({ "username": username, "password": "password123" });
+        let request = Request::post(SIGNUP_PATH)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = self.send(request).await;
+        assert_eq!(response.status, StatusCode::CREATED);
+        response.json()
     }
 
     fn config(dir: &TempDir, limits: Limits) -> server::Config {
@@ -102,6 +147,8 @@ impl TestServer {
             ffmpeg_path: "ffmpeg".into(),
             max_live_broadcasts: 2,
             live_idle_timeout: std::time::Duration::from_secs(20),
+            jwt_secret: Some(TEST_JWT_SECRET.into()),
+            jwt_ttl: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -128,6 +175,27 @@ impl TestServer {
             .await
     }
 
+    /// 주어진 토큰으로(없으면 비로그인으로) JSON 요청을 보낸다.
+    async fn request_as(
+        &self,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> TestResponse {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let request = match body {
+            Some(body) => request
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string())),
+            None => request.body(Body::empty()),
+        };
+        self.send(request.unwrap()).await
+    }
+
     async fn get_range(&self, uri: &str, range: &str) -> TestResponse {
         let request = Request::get(uri)
             .header(header::RANGE, range)
@@ -136,7 +204,14 @@ impl TestServer {
         self.send(request).await
     }
 
+    /// 기본 사용자로 방송 등록을 보낸다.
     async fn post_registration(&self, parts: &[Part<'_>]) -> TestResponse {
+        let token = self.owner.token.clone();
+        self.post_registration_as(Some(&token), parts).await
+    }
+
+    /// 주어진 토큰으로(없으면 비로그인으로) 방송 등록을 보낸다.
+    async fn post_registration_as(&self, token: Option<&str>, parts: &[Part<'_>]) -> TestResponse {
         let mut body = Vec::new();
         for part in parts {
             body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
@@ -169,14 +244,14 @@ impl TestServer {
         }
         body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
 
-        let request = Request::post("/api/broadcasts")
-            .header(
-                header::CONTENT_TYPE,
-                format!("multipart/form-data; boundary={BOUNDARY}"),
-            )
-            .body(Body::from(body))
-            .unwrap();
-        self.send(request).await
+        let mut request = Request::post("/api/broadcasts").header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        );
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        self.send(request.body(Body::from(body)).unwrap()).await
     }
 
     /// 제목과 mp4 녹화본으로 방송을 등록하고, 성공을 확인한 뒤 방송을 돌려준다.
@@ -239,9 +314,10 @@ impl TestServer {
     async fn insert_live_broadcast(&self, title: &str) -> uuid::Uuid {
         let id = uuid::Uuid::now_v7();
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-        sqlx::query("INSERT INTO broadcasts (id, title, created_at) VALUES (?, ?, ?)")
+        sqlx::query("INSERT INTO broadcasts (id, title, owner_id, created_at) VALUES (?, ?, ?, ?)")
             .bind(id.to_string())
             .bind(title)
+            .bind(self.owner.user.id.to_string())
             .bind(now)
             .execute(&self.db().await)
             .await
@@ -596,11 +672,8 @@ async fn 배포_시_서버가_웹_화면도_서빙하고_모르는_경로는_진
     let dir = tempfile::tempdir().unwrap();
     let mut config = TestServer::config(&dir, Limits::default());
     config.web_dist_dir = Some(fake_web_dist(&dir));
-    let server = TestServer {
-        app: server::build_app(config).await.unwrap(),
-        limits: Limits::default(),
-        dir,
-    };
+    let app = server::build_app(config).await.unwrap();
+    let server = TestServer::with_app(dir, Limits::default(), app).await;
     let created = server.register("공유할 방송", &sample_video(10)).await;
 
     for path in [
@@ -704,18 +777,19 @@ async fn 잘못된_상태로_방송_목록을_요청하면_400이다() {
 }
 
 #[tokio::test]
-async fn 상태_도입_전에_등록된_방송은_마이그레이션_후_종료_상태가_된다() {
+async fn 로그인_도입_전의_방송은_마이그레이션_후_녹화본과_함께_지워진다() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
+    let recordings = dir.path().join("recordings");
 
-    // 과제 1 시점의 스키마(마이그레이션 0001, 0002)로 방송 하나를 남긴다.
+    // 과제 2 시점의 스키마(마이그레이션 0001~0003)에 소유자 없는 방송과 녹화본을 남긴다.
     let mut migrator = sqlx::migrate::Migrator::new(std::path::Path::new("migrations"))
         .await
         .unwrap();
     migrator.migrations = migrator
         .migrations
         .iter()
-        .filter(|m| m.version <= 2)
+        .filter(|m| m.version <= 3)
         .cloned()
         .collect::<Vec<_>>()
         .into();
@@ -728,27 +802,261 @@ async fn 상태_도입_전에_등록된_방송은_마이그레이션_후_종료_
     .unwrap();
     migrator.run(&pool).await.unwrap();
     let id = uuid::Uuid::now_v7();
+    let object_key = format!("{id}.mp4");
     let created_at = "2026-11-01T09:00:00.000000Z";
-    sqlx::query("INSERT INTO broadcasts (id, title, created_at) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO broadcasts (id, title, created_at, ended_at) VALUES (?, ?, ?, ?)")
         .bind(id.to_string())
-        .bind("과제 1 방송")
+        .bind("과제 2 방송")
+        .bind(created_at)
         .bind(created_at)
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO recordings (broadcast_id, storage_backend, object_key, content_type, size_bytes) \
+         VALUES (?, 'local', ?, 'video/mp4', 1000)",
+    )
+    .bind(id.to_string())
+    .bind(&object_key)
+    .execute(&pool)
+    .await
+    .unwrap();
     pool.close().await;
+    std::fs::create_dir_all(&recordings).unwrap();
+    std::fs::write(recordings.join(&object_key), sample_video(1000)).unwrap();
 
     let app = server::build_app(TestServer::config(&dir, Limits::default()))
         .await
         .unwrap();
-    let server = TestServer {
-        dir,
-        limits: Limits::default(),
-        app,
-    };
+    let server = TestServer::with_app(dir, Limits::default(), app).await;
 
+    assert_eq!(server.list_broadcasts().await, vec![]);
+    assert_eq!(
+        server.get(&format!("/api/broadcasts/{id}")).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(server.stored_file_count(), 0);
+    let policy: UploadPolicy = server.get(UPLOAD_POLICY_PATH).await.json();
+    assert_eq!(policy.remaining_bytes, server.limits.storage_quota_bytes);
+}
+
+#[tokio::test]
+async fn 로그인하지_않으면_방송을_등록할_수_없다() {
+    let server = TestServer::start().await;
+    let video = sample_video(100);
+
+    for token in [None, Some("not-a-jwt")] {
+        let response = server
+            .post_registration_as(token, &[Part::Text("title", "비로그인 방송"), mp4(&video)])
+            .await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "{token:?}");
+    }
+    assert_eq!(server.list_broadcasts().await, vec![]);
+    assert_eq!(server.stored_file_count(), 0);
+}
+
+#[tokio::test]
+async fn 등록한_사용자가_방송의_소유자가_된다() {
+    let server = TestServer::start().await;
+    let viewer = server.signup("viewer").await;
+
+    let created = server.register("내 방송", &sample_video(10)).await;
+    let response = server
+        .post_registration_as(
+            Some(&viewer.token),
+            &[
+                Part::Text("title", "다른 사람 방송"),
+                mp4(&sample_video(10)),
+            ],
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::CREATED);
+    let other: Broadcast = response.json();
+
+    assert_eq!(created.owner, server.owner.user);
+    assert_eq!(other.owner, viewer.user);
+    let list = server.list_broadcasts().await;
+    assert_eq!(list, vec![other, created.clone()]);
+    let detail: Broadcast = server
+        .get(&format!("/api/broadcasts/{}", created.id))
+        .await
+        .json();
+    assert_eq!(detail.owner.username, "owner");
+}
+
+/// 방송 관리 요청을 비로그인, 다른 사용자, 소유자 순으로 보내며 거절과 허용을 확인한다.
+/// 소유자 요청의 응답을 돌려준다.
+async fn assert_only_owner_allowed(
+    server: &TestServer,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> TestResponse {
+    let other = server.signup("other_user").await;
+
+    let anonymous = server.request_as(method, uri, None, body.clone()).await;
+    assert_eq!(
+        anonymous.status,
+        StatusCode::UNAUTHORIZED,
+        "비로그인 {method} {uri}"
+    );
+    assert_eq!(anonymous.error_message(), "로그인이 필요합니다.");
+
+    let forbidden = server
+        .request_as(method, uri, Some(&other.token), body.clone())
+        .await;
+    assert_eq!(
+        forbidden.status,
+        StatusCode::FORBIDDEN,
+        "다른 사용자 {method} {uri}"
+    );
+    assert_eq!(
+        forbidden.error_message(),
+        "이 방송의 소유자만 할 수 있습니다."
+    );
+
+    let token = server.owner.token.clone();
+    server.request_as(method, uri, Some(&token), body).await
+}
+
+#[tokio::test]
+async fn 소유자만_방송_제목을_바꿀_수_있다() {
+    let server = TestServer::start().await;
+    let created = server.register("원래 제목", &sample_video(10)).await;
+    let uri = format!("/api/broadcasts/{}", created.id);
+
+    let response = assert_only_owner_allowed(
+        &server,
+        "PATCH",
+        &uri,
+        Some(serde_json::json!({ "title": "  바뀐 제목  " })),
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json::<Broadcast>().title, "바뀐 제목");
+    let detail: Broadcast = server.get(&uri).await.json();
+    assert_eq!(detail.title, "바뀐 제목");
+    assert_eq!(detail.recording, created.recording);
+}
+
+#[tokio::test]
+async fn 바꿀_제목도_등록과_같은_규칙을_따른다() {
+    let server = TestServer::start().await;
+    let created = server.register("원래 제목", &sample_video(10)).await;
+    let uri = format!("/api/broadcasts/{}", created.id);
+    let token = server.owner.token.clone();
+
+    for (title, message) in [
+        ("   ".to_owned(), "제목을 입력해 주세요."),
+        ("가".repeat(101), "제목은 100자 이하로 입력해 주세요."),
+    ] {
+        let response = server
+            .request_as(
+                "PATCH",
+                &uri,
+                Some(&token),
+                Some(serde_json::json!({ "title": title })),
+            )
+            .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(response.error_message(), message);
+    }
+    let detail: Broadcast = server.get(&uri).await.json();
+    assert_eq!(detail.title, "원래 제목");
+}
+
+#[tokio::test]
+async fn 소유자만_방송을_삭제할_수_있고_녹화본과_저장_공간도_돌아온다() {
+    let server = TestServer::start().await;
+    let created = server.register("지울 방송", &sample_video(1000)).await;
+    let uri = format!("/api/broadcasts/{}", created.id);
+    let before: UploadPolicy = server.get(UPLOAD_POLICY_PATH).await.json();
+
+    let response = assert_only_owner_allowed(&server, "DELETE", &uri, None).await;
+
+    assert_eq!(response.status, StatusCode::NO_CONTENT);
+    assert_eq!(server.get(&uri).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        server.get(&recording_path(created.id)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(server.list_broadcasts().await, vec![]);
+    assert_eq!(server.stored_file_count(), 0);
+    let after: UploadPolicy = server.get(UPLOAD_POLICY_PATH).await.json();
+    assert_eq!(after.remaining_bytes, before.remaining_bytes + 1000);
+}
+
+#[tokio::test]
+async fn 라이브_중인_방송은_삭제할_수_없다() {
+    let server = TestServer::start().await;
+    let id = server.insert_live_broadcast("라이브 방송").await;
+    let token = server.owner.token.clone();
+
+    let response = server
+        .request_as(
+            "DELETE",
+            &format!("/api/broadcasts/{id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(
+        response.error_message(),
+        "라이브 중인 방송은 먼저 종료해야 삭제할 수 있습니다."
+    );
+    assert_eq!(server.list_by_status(BroadcastStatus::Live).await.len(), 1);
+}
+
+#[tokio::test]
+async fn 소유자만_라이브_방송을_종료할_수_있다() {
+    let server = TestServer::start().await;
+    let id = server.insert_live_broadcast("라이브 방송").await;
+
+    let response = assert_only_owner_allowed(&server, "POST", &broadcast_end_path(id), None).await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    let ended: Broadcast = response.json();
+    assert_eq!(ended.status, BroadcastStatus::Ended);
     let detail: Broadcast = server.get(&format!("/api/broadcasts/{id}")).await.json();
     assert_eq!(detail.status, BroadcastStatus::Ended);
-    assert_eq!(detail.ended_at, Some(detail.created_at));
-    assert_eq!(detail.created_at.to_rfc3339(), "2026-11-01T09:00:00+00:00");
+    assert_eq!(detail.ended_at, ended.ended_at);
+}
+
+#[tokio::test]
+async fn 이미_종료된_방송을_다시_종료하면_409다() {
+    let server = TestServer::start().await;
+    let created = server.register("끝난 방송", &sample_video(10)).await;
+    let token = server.owner.token.clone();
+
+    let response = server
+        .request_as("POST", &broadcast_end_path(created.id), Some(&token), None)
+        .await;
+
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(response.error_message(), "이미 종료된 방송입니다.");
+}
+
+#[tokio::test]
+async fn 없는_방송을_관리하려_하면_404고_로그인하지_않았으면_먼저_401이다() {
+    let server = TestServer::start().await;
+    let token = server.owner.token.clone();
+    let missing = uuid::Uuid::now_v7();
+
+    for (method, uri) in [
+        ("PATCH", format!("/api/broadcasts/{missing}")),
+        ("DELETE", format!("/api/broadcasts/{missing}")),
+        ("POST", broadcast_end_path(missing)),
+        ("DELETE", "/api/broadcasts/not-a-uuid".to_owned()),
+    ] {
+        let body = (method == "PATCH").then(|| serde_json::json!({ "title": "제목" }));
+        let found = server
+            .request_as(method, &uri, Some(&token), body.clone())
+            .await;
+        assert_eq!(found.status, StatusCode::NOT_FOUND, "{method} {uri}");
+        let anonymous = server.request_as(method, &uri, None, body).await;
+        assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+    }
 }

@@ -9,6 +9,8 @@ use uuid::Uuid;
 pub struct Broadcast {
     pub id: Uuid,
     pub title: String,
+    /// 방송한 사용자. 이 사용자만 방송을 관리할 수 있다.
+    pub owner: User,
     /// 등록 시각. 라이브 방송은 송출을 시작한 시각이다.
     pub created_at: DateTime<Utc>,
     pub status: BroadcastStatus,
@@ -114,6 +116,17 @@ pub fn broadcast_path(id: Uuid) -> String {
     format!("/api/broadcasts/{id}")
 }
 
+/// 라이브 종료 API 경로. 소유자가 송출하던 기기가 아닌 곳에서도 라이브 방송을 끝낼 수 있다.
+pub fn broadcast_end_path(id: Uuid) -> String {
+    format!("/api/broadcasts/{id}/end")
+}
+
+/// 방송 수정 요청. 소유자만 할 수 있다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpdateBroadcast {
+    pub title: String,
+}
+
 /// 업로드 한도 API 경로.
 pub const UPLOAD_POLICY_PATH: &str = "/api/upload-policy";
 
@@ -132,7 +145,7 @@ pub const LIVE_PLAYLIST_FILE: &str = "index.m3u8";
 
 /// 송출 WebSocket 경로.
 ///
-/// 송출자가 연결을 열고 [`IngestClientMessage::Start`]를 보내면 서버가 라이브 방송을 만들고
+/// 로그인한 송출자가 연결을 열고 토큰을 담은 [`IngestClientMessage::Start`]를 보내면 서버가 라이브 방송을 만들고
 /// [`IngestServerMessage::Started`]로 답한다. 이후 바이너리 메시지는 모두 브라우저
 /// MediaRecorder가 만든 녹화 조각이다. [`IngestClientMessage::End`]를 보내거나 연결이 끊기면
 /// 방송이 종료된다. 연결의 수명이 곧 라이브 방송의 수명이다.
@@ -144,6 +157,10 @@ pub const LIVE_INGEST_PATH: &str = "/api/live/ingest";
 pub enum IngestClientMessage {
     /// 송출 시작. 연결 후 첫 메시지여야 한다.
     Start {
+        /// 로그인 토큰. 브라우저 WebSocket은 헤더를 붙일 수 없어 메시지에 싣는다.
+        /// 송출한 사용자가 방송의 소유자가 된다.
+        #[serde(default)]
+        token: Option<String>,
         title: String,
         /// MediaRecorder 녹화 형식. 예: `video/webm;codecs=vp8,opus`, `video/mp4`.
         mime_type: String,
@@ -162,4 +179,94 @@ pub enum IngestServerMessage {
     Ended { reason: Option<String> },
     /// 송출을 시작할 수 없다. 방송은 만들어지지 않았다.
     Error { message: String },
+}
+
+/// 로그인한 사용자. 방송 소유자와 댓글 작성자로도 쓰인다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct User {
+    pub id: Uuid,
+    /// 아이디. 화면에 보이는 이름으로도 쓴다.
+    pub username: String,
+}
+
+/// 회원가입·로그인 요청.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
+/// 회원가입·로그인 응답. 이후 요청의 `Authorization: Bearer {token}`에 쓴다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthResponse {
+    pub token: String,
+    pub user: User,
+}
+
+/// 아이디 길이(글자 수). 영문 소문자·숫자·밑줄만 쓸 수 있고, 대문자는 소문자로 바꿔 저장한다.
+pub const USERNAME_MIN_CHARS: usize = 3;
+pub const USERNAME_MAX_CHARS: usize = 20;
+/// 비밀번호 길이(글자 수).
+pub const PASSWORD_MIN_CHARS: usize = 8;
+pub const PASSWORD_MAX_CHARS: usize = 72;
+
+/// 회원가입 API 경로. 가입하면 바로 로그인된 토큰을 돌려준다.
+pub const SIGNUP_PATH: &str = "/api/auth/signup";
+/// 로그인 API 경로.
+pub const LOGIN_PATH: &str = "/api/auth/login";
+/// 로그아웃 API 경로. 요청에 쓴 토큰을 폐기한다.
+pub const LOGOUT_PATH: &str = "/api/auth/logout";
+/// 내 정보 API 경로. 토큰이 아직 유효한지 확인할 때도 쓴다.
+pub const ME_PATH: &str = "/api/auth/me";
+
+/// 방송에 남긴 댓글.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Comment {
+    pub id: Uuid,
+    pub broadcast_id: Uuid,
+    /// 댓글을 쓴 사용자. 이 사용자만 댓글을 지울 수 있다.
+    pub author: User,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 댓글 작성 요청. 로그인한 사용자만 쓸 수 있다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewComment {
+    pub body: String,
+}
+
+/// 댓글의 최대 글자 수(앞뒤 공백 제거 후).
+pub const COMMENT_MAX_CHARS: usize = 300;
+
+/// 댓글 목록에 담는 최대 개수. 이보다 많으면 최근 댓글만 오래된 순으로 돌려준다.
+pub const COMMENT_LIST_LIMIT: usize = 500;
+
+/// 방송의 댓글 목록(GET, 공개)과 댓글 작성(POST, 로그인 필요) API 경로.
+pub fn comments_path(broadcast_id: Uuid) -> String {
+    format!("/api/broadcasts/{broadcast_id}/comments")
+}
+
+/// 댓글 삭제 API 경로(DELETE, 작성자만).
+pub fn comment_path(broadcast_id: Uuid, comment_id: Uuid) -> String {
+    format!("/api/broadcasts/{broadcast_id}/comments/{comment_id}")
+}
+
+/// 댓글 실시간 WebSocket 경로(읽기 전용, 로그인 불필요).
+///
+/// 연결해 두면 그 방송에 댓글이 생기거나 지워질 때마다 서버가 [`CommentEvent`]를 보낸다.
+/// 연결 전에 쓰인 댓글은 보내지 않으므로, 연결한 뒤 [`comments_path`]로 목록을 받아 채운다.
+/// 방송이 삭제되면 서버가 연결을 닫는다.
+pub fn comments_ws_path(broadcast_id: Uuid) -> String {
+    format!("/api/broadcasts/{broadcast_id}/comments/ws")
+}
+
+/// 댓글 실시간 WebSocket으로 서버가 보내는 텍스트 메시지.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CommentEvent {
+    /// 댓글이 생겼다.
+    Created { comment: Comment },
+    /// 댓글이 지워졌다.
+    Deleted { comment_id: Uuid },
 }

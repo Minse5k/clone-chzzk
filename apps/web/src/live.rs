@@ -172,8 +172,10 @@ pub struct LiveSession {
 
 impl LiveSession {
     /// 서버에 연결해 송출을 시작한다. 진행 상황은 `events`로 알린다.
+    /// 송출한 사용자(토큰의 주인)가 방송의 소유자가 된다.
     pub fn start(
         stream: &MediaStream,
+        token: &str,
         title: &str,
         events: UnboundedSender<LiveEvent>,
     ) -> Result<Self, String> {
@@ -193,6 +195,7 @@ impl LiveSession {
         let on_open = {
             let socket = socket.clone();
             let start = IngestClientMessage::Start {
+                token: Some(token.to_owned()),
                 title: title.to_owned(),
                 mime_type: mime_type.to_owned(),
             };

@@ -1,13 +1,17 @@
 //! 서버 HTTP API 호출.
 
-use gloo_net::http::{Request, Response};
+use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::{Deserialize, de::DeserializeOwned};
 use shared::{
-    Broadcast, UPLOAD_POLICY_PATH, UploadPolicy, broadcast_path, live_playlist_path,
-    recording_path, registration_fields,
+    AuthResponse, Broadcast, Comment, Credentials, LOGIN_PATH, LOGOUT_PATH, ME_PATH, NewComment,
+    SIGNUP_PATH, UPLOAD_POLICY_PATH, UpdateBroadcast, UploadPolicy, User, broadcast_end_path,
+    broadcast_path, comment_path, comments_path, live_playlist_path, recording_path,
+    registration_fields,
 };
 use uuid::Uuid;
 use web_sys::{File, FormData};
+
+use crate::session;
 
 /// 서버 주소. 웹을 빌드할 때 `API_BASE_URL`로 정한다.
 /// 비워 두면 웹을 서빙한 곳과 같은 출처로 호출한다(배포 시).
@@ -86,7 +90,7 @@ pub async fn register_broadcast(title: &str, recording: &File) -> ApiResult<Broa
             )
         })
         .map_err(|_| "업로드를 준비할 수 없습니다.".to_owned())?;
-    let request = Request::post(&url("/api/broadcasts"))
+    let request = authorized(Request::post(&url("/api/broadcasts")))
         .body(form)
         .map_err(|_| "업로드를 준비할 수 없습니다.".to_owned())?;
     let response = request.send().await.map_err(|_| {
@@ -94,6 +98,117 @@ pub async fn register_broadcast(title: &str, recording: &File) -> ApiResult<Broa
         "업로드에 실패했습니다. 파일 크기와 네트워크 상태를 확인하고 다시 시도해 주세요.".to_owned()
     })?;
     read_json(Ok(response)).await
+}
+
+/// 로그인했으면 요청에 토큰을 붙인다.
+fn authorized(request: RequestBuilder) -> RequestBuilder {
+    match session::token() {
+        Some(token) => request.header("Authorization", &format!("Bearer {token}")),
+        None => request,
+    }
+}
+
+/// 회원가입. 성공하면 바로 로그인된다.
+pub async fn signup(credentials: &Credentials) -> ApiResult<AuthResponse> {
+    send_credentials(SIGNUP_PATH, credentials).await
+}
+
+pub async fn login(credentials: &Credentials) -> ApiResult<AuthResponse> {
+    send_credentials(LOGIN_PATH, credentials).await
+}
+
+async fn send_credentials(path: &str, credentials: &Credentials) -> ApiResult<AuthResponse> {
+    let request = Request::post(&url(path))
+        .json(credentials)
+        .map_err(|_| "요청을 준비할 수 없습니다.".to_owned())?;
+    read_json(request.send().await).await
+}
+
+/// 내 정보. 저장해 둔 토큰이 아직 유효한지 확인한다(401이면 로그아웃 상태가 된다).
+pub async fn me() -> ApiResult<User> {
+    read_json(authorized(Request::get(&url(ME_PATH))).send().await).await
+}
+
+/// 서버에서 지금 토큰을 폐기한다.
+pub async fn logout() -> ApiResult<()> {
+    let response = authorized(Request::post(&url(LOGOUT_PATH)))
+        .send()
+        .await
+        .map_err(|_| "서버에 연결할 수 없습니다.".to_owned())?;
+    if response.ok() {
+        Ok(())
+    } else {
+        Err(error_message(response).await)
+    }
+}
+
+/// 방송 제목을 바꾼다(소유자만).
+pub async fn update_broadcast(id: Uuid, title: &str) -> ApiResult<Broadcast> {
+    let request = authorized(Request::patch(&url(&broadcast_path(id))))
+        .json(&UpdateBroadcast {
+            title: title.to_owned(),
+        })
+        .map_err(|_| "요청을 준비할 수 없습니다.".to_owned())?;
+    read_json(request.send().await).await
+}
+
+/// 방송을 지운다(소유자만, 종료된 방송만).
+pub async fn delete_broadcast(id: Uuid) -> ApiResult<()> {
+    let response = authorized(Request::delete(&url(&broadcast_path(id))))
+        .send()
+        .await
+        .map_err(|_| "서버에 연결할 수 없습니다.".to_owned())?;
+    if response.ok() {
+        Ok(())
+    } else {
+        Err(error_message(response).await)
+    }
+}
+
+/// 라이브 방송을 종료한다(소유자만). 송출하던 기기가 아니어도 된다.
+pub async fn end_broadcast(id: Uuid) -> ApiResult<Broadcast> {
+    read_json(
+        authorized(Request::post(&url(&broadcast_end_path(id))))
+            .send()
+            .await,
+    )
+    .await
+}
+
+/// 방송의 댓글 목록, 오래된 순.
+pub async fn list_comments(broadcast_id: Uuid) -> ApiResult<Vec<Comment>> {
+    read_json(
+        Request::get(&url(&comments_path(broadcast_id)))
+            .send()
+            .await,
+    )
+    .await
+}
+
+/// 댓글을 쓴다(로그인 필요).
+pub async fn create_comment(broadcast_id: Uuid, body: &str) -> ApiResult<Comment> {
+    let request = authorized(Request::post(&url(&comments_path(broadcast_id))))
+        .json(&NewComment {
+            body: body.to_owned(),
+        })
+        .map_err(|_| "요청을 준비할 수 없습니다.".to_owned())?;
+    read_json(request.send().await).await
+}
+
+/// 댓글을 지운다(작성자만).
+pub async fn delete_comment(broadcast_id: Uuid, comment_id: Uuid) -> ApiResult<()> {
+    let response = authorized(Request::delete(&url(&comment_path(
+        broadcast_id,
+        comment_id,
+    ))))
+    .send()
+    .await
+    .map_err(|_| "서버에 연결할 수 없습니다.".to_owned())?;
+    if response.ok() {
+        Ok(())
+    } else {
+        Err(error_message(response).await)
+    }
 }
 
 #[derive(Deserialize)]
@@ -106,13 +221,21 @@ async fn read_json<T: DeserializeOwned>(
 ) -> ApiResult<T> {
     let response = response.map_err(|_| "서버에 연결할 수 없습니다.".to_owned())?;
     if !response.ok() {
-        return Err(match response.json::<ErrorBody>().await {
-            Ok(body) => body.message,
-            Err(_) => format!("요청이 실패했습니다 (HTTP {}).", response.status()),
-        });
+        return Err(error_message(response).await);
     }
     response
         .json()
         .await
         .map_err(|_| "서버 응답을 해석할 수 없습니다.".to_owned())
+}
+
+/// 실패한 응답의 안내 문구. 서버가 토큰을 거절(401)했으면 로그아웃 상태로 바꾼다.
+async fn error_message(response: Response) -> String {
+    if response.status() == 401 {
+        session::sign_out();
+    }
+    match response.json::<ErrorBody>().await {
+        Ok(body) => body.message,
+        Err(_) => format!("요청이 실패했습니다 (HTTP {}).", response.status()),
+    }
 }

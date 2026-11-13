@@ -12,11 +12,13 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
 use shared::{
-    Broadcast, BroadcastStatus, IngestClientMessage, IngestServerMessage, LIVE_INGEST_PATH,
-    UPLOAD_POLICY_PATH, UploadPolicy, broadcast_path, broadcasts_path, live_playlist_path,
-    recording_path,
+    AuthResponse, Broadcast, BroadcastStatus, IngestClientMessage, IngestServerMessage,
+    LIVE_INGEST_PATH, SIGNUP_PATH, UPLOAD_POLICY_PATH, UploadPolicy, broadcast_end_path,
+    broadcast_path, broadcasts_path, live_playlist_path, recording_path,
 };
 use tempfile::TempDir;
+
+const TEST_JWT_SECRET: &str = "test-only-jwt-secret";
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use tower::ServiceExt;
@@ -29,6 +31,8 @@ struct LiveServer {
     dir: TempDir,
     app: Router,
     addr: SocketAddr,
+    /// 기본 송출자. 서버를 띄울 때 가입한다.
+    owner: AuthResponse,
 }
 
 struct Response {
@@ -68,6 +72,8 @@ impl LiveServer {
             ffmpeg_path: "ffmpeg".into(),
             max_live_broadcasts: 2,
             live_idle_timeout: Duration::from_secs(20),
+            jwt_secret: Some(TEST_JWT_SECRET.into()),
+            jwt_ttl: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -76,7 +82,13 @@ impl LiveServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(axum::serve(listener, app.clone()).into_future());
-        Self { dir, app, addr }
+        let owner = signup(&app, "owner").await;
+        Self {
+            dir,
+            app,
+            addr,
+            owner,
+        }
     }
 
     async fn get(&self, uri: &str) -> Response {
@@ -98,6 +110,15 @@ impl LiveServer {
             content_type,
             body: body.to_vec(),
         }
+    }
+
+    /// 주어진 토큰으로 본문 없는 POST 요청을 보내고 상태 코드를 돌려준다.
+    async fn post_as(&self, uri: &str, token: &str) -> StatusCode {
+        let request = Request::post(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        self.app.clone().oneshot(request).await.unwrap().status()
     }
 
     async fn get_json<T: DeserializeOwned>(&self, uri: &str) -> T {
@@ -131,9 +152,11 @@ impl LiveServer {
         .unwrap();
         let id = Uuid::now_v7().to_string();
         sqlx::query(
-            "INSERT INTO broadcasts (id, title, created_at, ended_at) VALUES (?, '큰 방송', ?, ?)",
+            "INSERT INTO broadcasts (id, title, owner_id, created_at, ended_at) \
+             VALUES (?, '큰 방송', ?, ?, ?)",
         )
         .bind(&id)
+        .bind(self.owner.user.id.to_string())
         .bind("2026-11-12T09:00:00.000000Z")
         .bind("2026-11-12T09:00:00.000000Z")
         .execute(&pool)
@@ -160,13 +183,18 @@ impl LiveServer {
     /// 송출 시작을 보내고, 거부되었는지와 그 이유를 확인한다.
     async fn assert_start_rejected(&self, message: &str) {
         let mut socket = self.connect().await;
-        send(&mut socket, &start_message("거부될 방송")).await;
+        send(&mut socket, &self.start_message("거부될 방송")).await;
         assert_eq!(
             receive(&mut socket).await,
             IngestServerMessage::Error {
                 message: message.into()
             }
         );
+    }
+
+    /// 기본 송출자의 송출 시작 메시지.
+    fn start_message(&self, title: &str) -> IngestClientMessage {
+        start_message(Some(&self.owner.token), title)
     }
 
     async fn connect(&self) -> Socket {
@@ -177,7 +205,7 @@ impl LiveServer {
     /// 송출을 시작하고 만들어진 라이브 방송을 돌려준다.
     async fn start_broadcast(&self, title: &str) -> (Socket, Broadcast) {
         let mut socket = self.connect().await;
-        send(&mut socket, &start_message(title)).await;
+        send(&mut socket, &self.start_message(title)).await;
         match receive(&mut socket).await {
             IngestServerMessage::Started { broadcast } => (socket, broadcast),
             other => panic!("송출이 시작되지 않았습니다: {other:?}"),
@@ -202,8 +230,22 @@ impl LiveServer {
     }
 }
 
-fn start_message(title: &str) -> IngestClientMessage {
+/// 사용자를 가입시키고 로그인 정보를 돌려준다.
+async fn signup(app: &Router, username: &str) -> AuthResponse {
+    let body = serde_json::json!({ "username": username, "password": "password123" });
+    let request = Request::post(SIGNUP_PATH)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&body).unwrap()
+}
+
+fn start_message(token: Option<&str>, title: &str) -> IngestClientMessage {
     IngestClientMessage::Start {
+        token: token.map(Into::into),
         title: title.into(),
         mime_type: "video/webm;codecs=vp8,opus".into(),
     }
@@ -411,7 +453,7 @@ async fn 제목이_규칙에_맞지_않으면_송출을_시작하지_않는다()
         ),
     ] {
         let mut socket = server.connect().await;
-        send(&mut socket, &start_message(title)).await;
+        send(&mut socket, &server.start_message(title)).await;
         assert_eq!(
             receive(&mut socket).await,
             IngestServerMessage::Error { message }
@@ -564,13 +606,23 @@ async fn 서버가_송출_도중_멈췄다면_다시_시작할_때_방송을_종
     .unwrap();
     let with_video = Uuid::now_v7();
     let without_video = Uuid::now_v7();
+    let owner_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at) \
+         VALUES (?, 'earlier_owner', 'unused', '2026-11-12T09:00:00.000000Z')",
+    )
+    .bind(&owner_id)
+    .execute(&pool)
+    .await
+    .unwrap();
     for (id, title) in [
         (with_video, "조각이 남은 방송"),
         (without_video, "조각이 없는 방송"),
     ] {
-        sqlx::query("INSERT INTO broadcasts (id, title, created_at) VALUES (?, ?, ?)")
+        sqlx::query("INSERT INTO broadcasts (id, title, owner_id, created_at) VALUES (?, ?, ?, ?)")
             .bind(id.to_string())
             .bind(title)
+            .bind(&owner_id)
             .bind("2026-11-12T09:00:00.000000Z")
             .execute(&pool)
             .await
@@ -601,4 +653,86 @@ async fn 서버가_송출_도중_멈췄다면_다시_시작할_때_방송을_종
     let empty = server.broadcast(without_video).await;
     assert_eq!(empty.status, BroadcastStatus::Ended);
     assert_eq!(empty.recording, None);
+}
+
+#[tokio::test]
+async fn 로그인하지_않으면_송출을_시작하지_않는다() {
+    let server = LiveServer::start().await;
+
+    for (token, message) in [
+        (None, "로그인이 필요합니다."),
+        (
+            Some("not-a-jwt"),
+            "로그인이 만료되었거나 올바르지 않습니다. 다시 로그인해 주세요.",
+        ),
+    ] {
+        let mut socket = server.connect().await;
+        send(&mut socket, &start_message(token, "비로그인 방송")).await;
+        assert_eq!(
+            receive(&mut socket).await,
+            IngestServerMessage::Error {
+                message: message.into()
+            }
+        );
+    }
+
+    let all: Vec<Broadcast> = server.get_json(&broadcasts_path(None)).await;
+    assert!(all.is_empty());
+}
+
+#[tokio::test]
+async fn 송출한_사용자가_라이브_방송의_소유자가_된다() {
+    let server = LiveServer::start().await;
+
+    let (mut socket, broadcast) = server.start_broadcast("내 라이브").await;
+
+    assert_eq!(broadcast.owner, server.owner.user);
+    assert_eq!(
+        server.broadcast(broadcast.id).await.owner,
+        server.owner.user
+    );
+    send(&mut socket, &IngestClientMessage::End).await;
+    receive(&mut socket).await;
+}
+
+#[tokio::test]
+async fn 소유자가_다른_기기에서_라이브를_종료하면_송출이_이유와_함께_끝나고_녹화본이_남는다() {
+    let server = LiveServer::start().await;
+    let other = signup(&server.app, "other_user").await;
+    let (mut socket, started) = server.start_broadcast("다른 기기에서 끌 방송").await;
+    send_video(&mut socket, &sample_webm(3)).await;
+    server
+        .wait_for(started.id, "라이브 재생 가능", |b| b.live_playlist)
+        .await;
+
+    // 다른 사용자는 끌 수 없고 송출은 그대로 이어진다.
+    let end_path = broadcast_end_path(started.id);
+    assert_eq!(
+        server.post_as(&end_path, &other.token).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        server.broadcast(started.id).await.status,
+        BroadcastStatus::Live
+    );
+
+    assert_eq!(
+        server.post_as(&end_path, &server.owner.token).await,
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        receive(&mut socket).await,
+        IngestServerMessage::Ended {
+            reason: Some("소유자가 다른 기기에서 방송을 종료했습니다.".into())
+        }
+    );
+    let ended = server
+        .wait_for(started.id, "녹화본 있음", |b| b.recording.is_some())
+        .await;
+    assert_eq!(ended.status, BroadcastStatus::Ended);
+    // 송출 자리도 돌아와 바로 다시 송출할 수 있다.
+    let (mut next, _) = server.start_broadcast("다음 방송").await;
+    send(&mut next, &IngestClientMessage::End).await;
+    receive(&mut next).await;
 }
