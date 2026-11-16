@@ -436,3 +436,82 @@ pub fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
         })
         .collect()
 }
+
+/// 방송의 후원 합계와 내역. 실시간으로 확정된 후원은 앞에 붙이고 잠시 강조한다.
+#[component]
+pub fn DonationHistory(
+    broadcast_id: Uuid,
+    /// 실시간 알림으로 받은 후원(이 방송이 아닌 것도 섞여 있을 수 있어 거른다).
+    realtime: Signal<Vec<Donation>>,
+    /// 바뀌면 내역을 다시 받는다(실시간 연결이 다시 열렸을 때).
+    version: Signal<u32>,
+) -> Element {
+    let summary = use_resource(move || async move {
+        version();
+        api::donation_summary(broadcast_id).await
+    });
+
+    let summary = summary.read();
+    let Some(Ok(summary)) = summary.as_ref() else {
+        return match summary.as_ref() {
+            Some(Err(text)) => rsx! { p { class: "notice error", "{text}" } },
+            _ => rsx! {},
+        };
+    };
+    // 내역을 받은 뒤에 확정된 후원만 더한다(같은 후원이 두 번 세어지지 않게).
+    let fresh: Vec<Donation> = realtime
+        .read()
+        .iter()
+        .filter(|donation| donation.broadcast_id == broadcast_id)
+        .filter(|donation| {
+            summary
+                .donations
+                .iter()
+                .all(|known| known.order_id != donation.order_id)
+        })
+        .rev()
+        .cloned()
+        .collect();
+    let total = summary.total_amount + fresh.iter().map(|donation| donation.amount).sum::<u64>();
+    let count = summary.count + fresh.len() as u64;
+    let latest = fresh.first().cloned();
+
+    rsx! {
+        section { class: "donation-history",
+            h2 { "후원 {count}건 · 합계 {format_won(total)}" }
+            if let Some(latest) = latest {
+                p { class: "donation-alert", role: "status",
+                    "🎉 {latest.donor.username} 님이 {format_won(latest.amount)} 후원했습니다!"
+                    if !latest.message.is_empty() { " “{latest.message}”" }
+                }
+            }
+            if count == 0 {
+                p { class: "notice", "아직 후원이 없습니다." }
+            }
+            ul { class: "donation-list",
+                for donation in fresh.iter() {
+                    DonationItem { key: "{donation.order_id}", donation: donation.clone(), fresh: true }
+                }
+                for donation in summary.donations.iter() {
+                    DonationItem { key: "{donation.order_id}", donation: donation.clone(), fresh: false }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn DonationItem(donation: Donation, fresh: bool) -> Element {
+    rsx! {
+        li { class: if fresh { "donation fresh" } else { "donation" },
+            div { class: "comment-meta",
+                span { class: "author", "{donation.donor.username}" }
+                span { class: "amount", "{format_won(donation.amount)}" }
+                span { class: "time", {crate::format_time(donation.confirmed_at)} }
+            }
+            if !donation.message.is_empty() {
+                p { class: "comment-body", "{donation.message}" }
+            }
+        }
+    }
+}

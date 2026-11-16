@@ -148,7 +148,7 @@ impl CommentHub {
     }
 
     /// 구독자에게 알린다. 구독자가 없으면 채널을 정리한다.
-    fn publish(&self, broadcast_id: Uuid, event: CommentEvent) {
+    pub(crate) fn publish(&self, broadcast_id: Uuid, event: CommentEvent) {
         let mut channels = self.lock();
         if let Some(sender) = channels.get(&broadcast_id)
             && sender.send(event).is_err()

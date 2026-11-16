@@ -11,13 +11,13 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    routing::post,
+    routing::{get, post},
 };
 use chrono::Utc;
 use shared::{
-    BroadcastStatus, ConfirmDonation, DONATION_CONFIRM_PATH, DONATION_FAIL_PATH,
-    DONATION_MAX_AMOUNT, DONATION_MESSAGE_MAX_CHARS, DONATION_MIN_AMOUNT, Donation,
-    DonationFailure, DonationOrder, NewDonation, PAYMENT_WEBHOOK_PATH,
+    BroadcastStatus, CommentEvent, ConfirmDonation, DONATION_CONFIRM_PATH, DONATION_FAIL_PATH,
+    DONATION_LIST_LIMIT, DONATION_MAX_AMOUNT, DONATION_MESSAGE_MAX_CHARS, DONATION_MIN_AMOUNT,
+    Donation, DonationFailure, DonationOrder, DonationSummary, NewDonation, PAYMENT_WEBHOOK_PATH,
 };
 use uuid::Uuid;
 
@@ -31,7 +31,10 @@ use crate::{
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/broadcasts/{id}/donations", post(create_order))
+        .route(
+            "/api/broadcasts/{id}/donations",
+            get(list_donations).post(create_order),
+        )
         .route(DONATION_CONFIRM_PATH, post(confirm))
         .route(DONATION_FAIL_PATH, post(fail))
         .route(PAYMENT_WEBHOOK_PATH, post(webhook))
@@ -39,6 +42,21 @@ pub fn router() -> Router<AppState> {
 
 /// 사용자가 결제창에서 취소했다는 오류 코드. 결제창(`failUrl`)과 SDK가 각각 쓴다.
 const CANCEL_CODES: [&str; 2] = ["PAY_PROCESS_CANCELED", "USER_CANCEL"];
+
+/// 방송의 후원 내역과 합계. 로그인 없이 볼 수 있고, 확정된 후원만 센다.
+async fn list_donations(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<DonationSummary>, ApiError> {
+    let not_found = || ApiError::not_found("방송을 찾을 수 없습니다.");
+    let id = Uuid::parse_str(&id).map_err(|_| not_found())?;
+    db::find_broadcast(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(
+        db::donation_summary(&state.db, id, DONATION_LIST_LIMIT).await?,
+    ))
+}
 
 /// 후원 주문 생성. 로그인한 사용자가 라이브 중인 남의 방송에만 후원할 수 있다.
 /// 받는 사람은 클라이언트가 아니라 서버가 방송 소유자로 정한다.
@@ -166,7 +184,7 @@ async fn confirm(
         Err(err) => return Err(payment_unavailable(err)),
     };
 
-    let donation = finalize(&state, &order, &payment).await?;
+    let (donation, _) = finalize(&state, &order, &payment).await?;
     Ok(Json(donation))
 }
 
@@ -250,7 +268,8 @@ async fn webhook(
     match payment.status.as_str() {
         // 돈이 나간 결제다. 방송이 그사이 끝났어도 확정한다(승인 확인 요청이 확정 직전에 끊긴 경우).
         payments::STATUS_DONE => match finalize(&state, &order, &payment).await {
-            Ok(_) => Ok(webhook_result("confirmed")),
+            Ok((_, true)) => Ok(webhook_result("confirmed")),
+            Ok((_, false)) => Ok(webhook_result("already_processed")),
             Err(err) => {
                 tracing::warn!(order = %order.order_id, "웹훅으로 후원을 확정하지 않았습니다: {}", err.message());
                 Ok(webhook_result("closed"))
@@ -277,12 +296,13 @@ async fn webhook(
 }
 
 /// 토스페이먼츠가 알려 준 결제 결과를 주문과 대조하고, 맞으면 후원을 확정한다.
-/// 승인 확인과 웹훅이 모두 이 함수를 쓴다.
+/// 승인 확인과 웹훅이 모두 이 함수를 쓴다. 이번 호출로 새로 확정했으면 `true`와 함께 돌려주고,
+/// 그때만 시청 화면에 후원 알림을 보낸다.
 pub(crate) async fn finalize(
     state: &AppState,
     order: &StoredDonation,
     payment: &Payment,
-) -> Result<Donation, ApiError> {
+) -> Result<(Donation, bool), ApiError> {
     if let Err(problem) = verify(order, payment) {
         // 돈이 나간 결제가 주문과 다르면 사람이 확인해야 하므로 오류로 남긴다.
         tracing::error!(
@@ -295,8 +315,9 @@ pub(crate) async fn finalize(
         return Err(bad_request(reason));
     }
 
-    match db::confirm_donation(&state.db, &order.order_id, &payment.payment_key, Utc::now()).await?
-    {
+    let outcome =
+        db::confirm_donation(&state.db, &order.order_id, &payment.payment_key, Utc::now()).await?;
+    match outcome {
         ConfirmOutcome::Confirmed => {
             tracing::info!(
                 order = %order.order_id,
@@ -326,7 +347,17 @@ pub(crate) async fn finalize(
     if current.payment_key.as_deref() != Some(payment.payment_key.as_str()) {
         return Err(conflict("이미 처리된 후원 주문입니다."));
     }
-    confirmed(&current).map(|Json(donation)| donation)
+    let Json(donation) = confirmed(&current)?;
+    let newly_confirmed = outcome == ConfirmOutcome::Confirmed;
+    if newly_confirmed {
+        state.comments.publish(
+            donation.broadcast_id,
+            CommentEvent::Donated {
+                donation: donation.clone(),
+            },
+        );
+    }
+    Ok((donation, newly_confirmed))
 }
 
 /// 결제 결과가 주문과 같은지 확인한다: 승인 완료, 같은 주문번호, 같은 금액.

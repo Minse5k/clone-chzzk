@@ -18,8 +18,8 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use common::{Reply, TestApp};
 use serde_json::{Value, json};
 use shared::{
-    AuthResponse, DONATION_CONFIRM_PATH, DONATION_FAIL_PATH, Donation, DonationOrder,
-    PAYMENT_WEBHOOK_PATH, donations_path,
+    AuthResponse, CommentEvent, DONATION_CONFIRM_PATH, DONATION_FAIL_PATH, Donation, DonationOrder,
+    DonationSummary, PAYMENT_WEBHOOK_PATH, comments_path, comments_ws_path, donations_path,
 };
 use uuid::Uuid;
 
@@ -293,6 +293,23 @@ impl DonationFixture {
     async fn fail(&self, order_id: &str, code: &str) -> Reply {
         let token = self.viewer.token.clone();
         self.fail_as(Some(&token), order_id, code).await
+    }
+
+    /// 결제창 인증과 승인 확인까지 마쳐 후원을 확정한다.
+    async fn donate(&self, amount: u64, message: &str) -> Donation {
+        let order = self.order(amount, message).await;
+        let payment_key = self
+            .toss
+            .authorize(&order.order_id, amount, OnConfirm::Approve);
+        let reply = self.confirm(&payment_key, &order.order_id, amount).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.message());
+        reply.json()
+    }
+
+    async fn summary(&self) -> DonationSummary {
+        let reply = self.app.get(&donations_path(self.broadcast)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        reply.json()
     }
 
     /// 토스페이먼츠가 보내는 것과 같은 형식의 결제 상태 웹훅을 보낸다. 본문의 상태·금액은 서버가 믿지 않는다.
@@ -968,4 +985,117 @@ async fn 결제_서비스에_물을_수_없으면_웹훅을_다시_보내도록_
         .await;
 
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn 후원_내역은_확정된_후원만_최신순으로_담고_합계와_건수를_돌려준다() {
+    let fixture = DonationFixture::new().await;
+    assert_eq!(
+        fixture.summary().await,
+        DonationSummary {
+            total_amount: 0,
+            count: 0,
+            donations: vec![],
+        }
+    );
+
+    let first = fixture.donate(1_000, "첫 후원").await;
+    let second = fixture.donate(5_000, "두 번째").await;
+    // 확정되지 않은 주문들: 결제 대기, 취소, 실패.
+    fixture.order(9_000, "대기").await;
+    let canceled = fixture.order(9_000, "").await;
+    fixture
+        .fail(&canceled.order_id, "PAY_PROCESS_CANCELED")
+        .await;
+    let failed = fixture.order(9_000, "").await;
+    fixture.fail(&failed.order_id, "REJECT_CARD_COMPANY").await;
+
+    let summary = fixture.summary().await;
+
+    assert_eq!(summary.total_amount, 6_000);
+    assert_eq!(summary.count, 2);
+    assert_eq!(summary.donations, vec![second, first]);
+    // 내역은 로그인 없이 보고, 없는 방송은 404다.
+    assert_eq!(
+        fixture
+            .app
+            .get(&donations_path(Uuid::now_v7()))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn 끝난_방송에서도_후원_내역과_합계를_본다() {
+    let fixture = DonationFixture::new().await;
+    fixture.donate(3_000, "").await;
+    fixture.end_broadcast().await;
+
+    let summary = fixture.summary().await;
+
+    assert_eq!((summary.total_amount, summary.count), (3_000, 1));
+}
+
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn next_event(socket: &mut Socket) -> CommentEvent {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let next = async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).unwrap(),
+                Some(Ok(_)) => continue,
+                other => panic!("방송 알림 대신 {other:?}"),
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), next)
+        .await
+        .expect("5초 안에 방송 알림이 오지 않았습니다")
+}
+
+#[tokio::test]
+async fn 후원이_확정되면_시청_화면에_한_번만_알린다() {
+    let fixture = DonationFixture::new().await;
+    let url = format!(
+        "ws://{}{}",
+        fixture.app.addr,
+        comments_ws_path(fixture.broadcast)
+    );
+    let mut socket = tokio_tungstenite::connect_async(url).await.unwrap().0;
+    let order = fixture.order(5_000, "실시간 후원").await;
+    let payment_key = fixture
+        .toss
+        .authorize(&order.order_id, 5_000, OnConfirm::Approve);
+
+    let donation: Donation = fixture
+        .confirm(&payment_key, &order.order_id, 5_000)
+        .await
+        .json();
+    // 같은 결제의 승인 확인과 웹훅이 다시 와도 알림은 더 가지 않는다.
+    fixture.confirm(&payment_key, &order.order_id, 5_000).await;
+    webhook_result(&fixture.webhook(&payment_key, "DONE").await);
+    // 다음 알림이 이 댓글이면 그 사이에 중복 후원 알림이 없었던 것이다.
+    let comment = fixture
+        .app
+        .request(
+            "POST",
+            &comments_path(fixture.broadcast),
+            Some(&fixture.viewer.token),
+            Some(json!({ "body": "알림 경계" })),
+        )
+        .await;
+    assert_eq!(comment.status, StatusCode::CREATED);
+
+    assert_eq!(
+        next_event(&mut socket).await,
+        CommentEvent::Donated { donation }
+    );
+    assert!(matches!(
+        next_event(&mut socket).await,
+        CommentEvent::Created { .. }
+    ));
 }

@@ -784,3 +784,39 @@ pub async fn close_donation(
     .await?;
     Ok(result.rows_affected() == 1)
 }
+
+/// 방송의 확정 후원 합계·건수와 최근 후원 목록.
+pub async fn donation_summary(
+    pool: &SqlitePool,
+    broadcast_id: Uuid,
+    limit: usize,
+) -> anyhow::Result<shared::DonationSummary> {
+    let id = broadcast_id.to_string();
+    let (total, count): (i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(amount), 0), COUNT(*) FROM donations \
+         WHERE broadcast_id = ? AND status = 'confirmed'",
+    )
+    .bind(&id)
+    .fetch_one(pool)
+    .await?;
+    let donations = sqlx::query_as::<_, DonationRow>(sqlx::AssertSqlSafe(format!(
+        "{SELECT_DONATIONS} WHERE d.broadcast_id = ? AND d.status = 'confirmed' \
+         ORDER BY d.confirmed_at DESC, d.order_id DESC LIMIT ?"
+    )))
+    .bind(&id)
+    .bind(i64::try_from(limit)?)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        StoredDonation::try_from(row)?
+            .confirmed()
+            .ok_or_else(|| anyhow::anyhow!("확정 후원에 확정 시각이 없습니다"))
+    })
+    .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(shared::DonationSummary {
+        total_amount: total.try_into()?,
+        count: count.try_into()?,
+        donations,
+    })
+}

@@ -316,3 +316,20 @@ button.link {
 .donation-checkout { display: flex; flex-direction: column; gap: 8px; }
 .donation-checkout #toss-payment-methods,
 .donation-checkout #toss-agreement { background: #fff; border-radius: 8px; }
+
+.donation-history { margin-top: 24px; }
+.donation-list { list-style: none; margin: 8px 0 0; padding: 0; }
+.donation { padding: 10px 0; border-top: 1px solid var(--border); }
+.donation .amount { color: var(--live); font-weight: 800; }
+.donation.fresh { animation: donation-flash 3s ease-out; }
+.donation-alert {
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--live) 18%, transparent);
+    font-weight: 700;
+    animation: donation-flash 3s ease-out;
+}
+
+@keyframes donation-flash {
+    from { background: color-mix(in srgb, var(--live) 45%, transparent); }
+}

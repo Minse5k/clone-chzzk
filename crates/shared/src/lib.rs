@@ -254,14 +254,14 @@ pub fn comment_path(broadcast_id: Uuid, comment_id: Uuid) -> String {
 
 /// 댓글 실시간 WebSocket 경로(읽기 전용, 로그인 불필요).
 ///
-/// 연결해 두면 그 방송에 댓글이 생기거나 지워질 때마다 서버가 [`CommentEvent`]를 보낸다.
+/// 연결해 두면 그 방송에 댓글이 생기거나 지워지거나 후원이 확정될 때마다 서버가 [`CommentEvent`]를 보낸다.
 /// 연결 전에 쓰인 댓글은 보내지 않으므로, 연결한 뒤 [`comments_path`]로 목록을 받아 채운다.
 /// 방송이 삭제되면 서버가 연결을 닫는다.
 pub fn comments_ws_path(broadcast_id: Uuid) -> String {
     format!("/api/broadcasts/{broadcast_id}/comments/ws")
 }
 
-/// 댓글 실시간 WebSocket으로 서버가 보내는 텍스트 메시지.
+/// 댓글 실시간 WebSocket(방송 알림 채널)으로 서버가 보내는 텍스트 메시지.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommentEvent {
@@ -269,6 +269,8 @@ pub enum CommentEvent {
     Created { comment: Comment },
     /// 댓글이 지워졌다.
     Deleted { comment_id: Uuid },
+    /// 후원이 확정되었다. 같은 후원에 대해 한 번만 온다.
+    Donated { donation: Donation },
 }
 
 /// 후원 금액 범위(원).
@@ -349,3 +351,17 @@ pub const DONATION_FAIL_PATH: &str = "/api/donations/fail";
 /// 토스페이먼츠 결제 상태 웹훅을 받는 경로(공개). 개발자센터 > 웹훅에 `https://<주소>/api/payments/toss/webhook`으로 등록한다.
 /// 본문은 믿지 않고 결제 조회 API로 다시 확인한다.
 pub const PAYMENT_WEBHOOK_PATH: &str = "/api/payments/toss/webhook";
+
+/// 방송의 후원 내역과 합계(공개). 확정된 후원만 센다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DonationSummary {
+    /// 확정된 후원 금액의 합(원).
+    pub total_amount: u64,
+    /// 확정된 후원 수.
+    pub count: u64,
+    /// 최근 후원부터. 많으면 최근 [`DONATION_LIST_LIMIT`]건만 담는다(합계와 건수는 전체).
+    pub donations: Vec<Donation>,
+}
+
+/// 후원 내역에 담는 최대 건수.
+pub const DONATION_LIST_LIMIT: usize = 100;
