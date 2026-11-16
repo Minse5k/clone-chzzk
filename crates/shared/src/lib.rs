@@ -345,3 +345,7 @@ pub struct DonationFailure {
 
 /// 결제 실패·취소 통지 API 경로(로그인 필요, 주문한 사용자만).
 pub const DONATION_FAIL_PATH: &str = "/api/donations/fail";
+
+/// 토스페이먼츠 결제 상태 웹훅을 받는 경로(공개). 개발자센터 > 웹훅에 `https://<주소>/api/payments/toss/webhook`으로 등록한다.
+/// 본문은 믿지 않고 결제 조회 API로 다시 확인한다.
+pub const PAYMENT_WEBHOOK_PATH: &str = "/api/payments/toss/webhook";

@@ -17,7 +17,7 @@ use chrono::Utc;
 use shared::{
     BroadcastStatus, ConfirmDonation, DONATION_CONFIRM_PATH, DONATION_FAIL_PATH,
     DONATION_MAX_AMOUNT, DONATION_MESSAGE_MAX_CHARS, DONATION_MIN_AMOUNT, Donation,
-    DonationFailure, DonationOrder, NewDonation,
+    DonationFailure, DonationOrder, NewDonation, PAYMENT_WEBHOOK_PATH,
 };
 use uuid::Uuid;
 
@@ -34,6 +34,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/broadcasts/{id}/donations", post(create_order))
         .route(DONATION_CONFIRM_PATH, post(confirm))
         .route(DONATION_FAIL_PATH, post(fail))
+        .route(PAYMENT_WEBHOOK_PATH, post(webhook))
 }
 
 /// 사용자가 결제창에서 취소했다는 오류 코드. 결제창(`failUrl`)과 SDK가 각각 쓴다.
@@ -196,6 +197,82 @@ async fn fail(
         // 이미 실패·취소로 끝난 주문이다(같은 통지가 다시 왔다).
         DonationStatus::Failed | DonationStatus::Canceled => Ok(StatusCode::NO_CONTENT),
         DonationStatus::Confirmed => Err(conflict("이미 확정된 후원은 실패로 바꿀 수 없습니다.")),
+    }
+}
+
+/// 웹훅을 처리한 결과. 토스페이먼츠는 상태 코드만 보지만, 직접 확인할 때 무엇이 일어났는지 알 수 있게 담는다.
+#[derive(serde::Serialize)]
+struct WebhookResult {
+    /// `confirmed`(새로 확정), `already_processed`(이미 처리됨), `closed`(실패·취소로 끝냄), `ignored`(처리할 것 없음)
+    result: &'static str,
+}
+
+fn webhook_result(result: &'static str) -> (StatusCode, Json<WebhookResult>) {
+    (StatusCode::OK, Json(WebhookResult { result }))
+}
+
+/// 토스페이먼츠 결제 상태 웹훅(`PAYMENT_STATUS_CHANGED`).
+///
+/// 웹훅에는 서명이 없어 본문을 믿지 않는다. 본문에서는 결제 키만 꺼내 결제 조회 API로 지금 상태를 다시 묻고,
+/// 그 결과로 승인 확인과 같은 확정 경로를 탄다. 같은 통지가 여러 번 와도(재전송) 조건부 갱신 때문에 한 번만 적립된다.
+/// 처리할 것이 없으면 200으로 답해 재전송을 멈추고, 결제 서비스에 묻지 못했으면 5xx로 답해 다시 보내게 한다.
+async fn webhook(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<WebhookResult>), ApiError> {
+    if body["eventType"].as_str() != Some("PAYMENT_STATUS_CHANGED") {
+        return Ok(webhook_result("ignored"));
+    }
+    let Some(payment_key) = body["data"]["paymentKey"].as_str() else {
+        return Ok(webhook_result("ignored"));
+    };
+    let payments = payments_or_unavailable(&state)?;
+    let payment = match payments.get(payment_key).await {
+        Ok(payment) => payment,
+        Err(PaymentError::Rejected { code, message }) => {
+            tracing::warn!("웹훅의 결제를 조회할 수 없어 무시합니다: {code} {message}");
+            return Ok(webhook_result("ignored"));
+        }
+        Err(err) => return Err(payment_unavailable(err)),
+    };
+    // 주문번호도 본문이 아니라 조회 결과에서 가져온다.
+    let Some(order) = db::find_donation(&state.db, &payment.order_id).await? else {
+        return Ok(webhook_result("ignored"));
+    };
+    if order.status != DonationStatus::Pending {
+        if order.status == DonationStatus::Confirmed && payment.status != payments::STATUS_DONE {
+            // 확정된 후원의 결제가 취소되었다(개발자센터에서 취소 등). 환불 처리는 범위 밖이라 기록만 남긴다.
+            tracing::warn!(order = %order.order_id, "확정된 후원의 결제 상태가 {}로 바뀌었습니다", payment.status);
+        }
+        return Ok(webhook_result("already_processed"));
+    }
+
+    match payment.status.as_str() {
+        // 돈이 나간 결제다. 방송이 그사이 끝났어도 확정한다(승인 확인 요청이 확정 직전에 끊긴 경우).
+        payments::STATUS_DONE => match finalize(&state, &order, &payment).await {
+            Ok(_) => Ok(webhook_result("confirmed")),
+            Err(err) => {
+                tracing::warn!(order = %order.order_id, "웹훅으로 후원을 확정하지 않았습니다: {}", err.message());
+                Ok(webhook_result("closed"))
+            }
+        },
+        "ABORTED" | "EXPIRED" => {
+            let reason = format!("결제가 끝나지 않았습니다({}).", payment.status);
+            close(&state, &order, DonationStatus::Failed, &reason).await?;
+            Ok(webhook_result("closed"))
+        }
+        "CANCELED" | "PARTIAL_CANCELED" => {
+            close(
+                &state,
+                &order,
+                DonationStatus::Canceled,
+                "결제가 취소되었습니다.",
+            )
+            .await?;
+            Ok(webhook_result("closed"))
+        }
+        // 결제 진행 중(READY, IN_PROGRESS 등). 아직 처리할 것이 없다.
+        _ => Ok(webhook_result("ignored")),
     }
 }
 

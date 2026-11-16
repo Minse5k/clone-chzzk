@@ -19,7 +19,7 @@ use common::{Reply, TestApp};
 use serde_json::{Value, json};
 use shared::{
     AuthResponse, DONATION_CONFIRM_PATH, DONATION_FAIL_PATH, Donation, DonationOrder,
-    donations_path,
+    PAYMENT_WEBHOOK_PATH, donations_path,
 };
 use uuid::Uuid;
 
@@ -84,6 +84,18 @@ impl FakeToss {
             },
         );
         payment_key
+    }
+
+    /// 토스페이먼츠 쪽에서 결제 상태가 바뀐 것으로 만든다. 승인 확인 요청이 서버에 닿지 못했거나,
+    /// 결제가 실패·만료된 경우를 웹훅 테스트에서 재현한다.
+    fn set_status(&self, payment_key: &str, status: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .payments
+            .get_mut(payment_key)
+            .unwrap()
+            .status = status.into();
     }
 
     fn confirm_calls(&self) -> usize {
@@ -281,6 +293,27 @@ impl DonationFixture {
     async fn fail(&self, order_id: &str, code: &str) -> Reply {
         let token = self.viewer.token.clone();
         self.fail_as(Some(&token), order_id, code).await
+    }
+
+    /// 토스페이먼츠가 보내는 것과 같은 형식의 결제 상태 웹훅을 보낸다. 본문의 상태·금액은 서버가 믿지 않는다.
+    async fn webhook(&self, payment_key: &str, claimed_status: &str) -> Reply {
+        self.app
+            .request(
+                "POST",
+                PAYMENT_WEBHOOK_PATH,
+                None,
+                Some(json!({
+                    "eventType": "PAYMENT_STATUS_CHANGED",
+                    "createdAt": "2026-11-16T10:00:00.000000",
+                    "data": {
+                        "paymentKey": payment_key,
+                        "orderId": "본문의 주문번호는 쓰지 않는다",
+                        "status": claimed_status,
+                        "totalAmount": 1,
+                    },
+                })),
+            )
+            .await
     }
 
     /// 방송자가 라이브를 끝낸다.
@@ -743,4 +776,196 @@ async fn 결제_중에_방송이_끝나면_결제를_승인하지_않고_주문�
     assert_eq!(fixture.toss.confirm_calls(), 0);
     assert_eq!(fixture.status(&order.order_id).await, "canceled");
     assert_eq!(fixture.confirmed_total().await, (0, 0));
+}
+
+fn webhook_result(reply: &Reply) -> String {
+    assert_eq!(
+        reply.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    reply.json::<Value>()["result"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn 사용자가_성공_화면으로_돌아오지_않아도_웹훅으로_후원이_확정된다() {
+    let fixture = DonationFixture::new().await;
+    let order = fixture.order(7_000, "웹훅으로 확정").await;
+    let payment_key = fixture
+        .toss
+        .authorize(&order.order_id, 7_000, OnConfirm::Approve);
+    // 결제는 승인되었지만 승인 확인 요청이 서버에 닿지 못했다.
+    fixture.toss.set_status(&payment_key, "DONE");
+
+    let reply = fixture.webhook(&payment_key, "DONE").await;
+
+    assert_eq!(webhook_result(&reply), "confirmed");
+    assert_eq!(fixture.status(&order.order_id).await, "confirmed");
+    assert_eq!(fixture.confirmed_total().await, (1, 7_000));
+}
+
+#[tokio::test]
+async fn 같은_웹훅이_여러_번_와도_한_번만_적립된다() {
+    let fixture = DonationFixture::new().await;
+    let order = fixture.order(7_000, "").await;
+    let payment_key = fixture
+        .toss
+        .authorize(&order.order_id, 7_000, OnConfirm::Approve);
+    fixture.toss.set_status(&payment_key, "DONE");
+
+    let results = [
+        webhook_result(&fixture.webhook(&payment_key, "DONE").await),
+        webhook_result(&fixture.webhook(&payment_key, "DONE").await),
+        webhook_result(&fixture.webhook(&payment_key, "DONE").await),
+    ];
+
+    assert_eq!(
+        results,
+        ["confirmed", "already_processed", "already_processed"]
+    );
+    assert_eq!(fixture.confirmed_total().await, (1, 7_000));
+}
+
+#[tokio::test]
+async fn 승인_확인_뒤에_웹훅이_와도_한_번만_적립된다() {
+    let fixture = DonationFixture::new().await;
+    let order = fixture.order(7_000, "").await;
+    let payment_key = fixture
+        .toss
+        .authorize(&order.order_id, 7_000, OnConfirm::Approve);
+    assert_eq!(
+        fixture
+            .confirm(&payment_key, &order.order_id, 7_000)
+            .await
+            .status,
+        StatusCode::OK
+    );
+
+    let reply = fixture.webhook(&payment_key, "DONE").await;
+
+    assert_eq!(webhook_result(&reply), "already_processed");
+    assert_eq!(fixture.confirmed_total().await, (1, 7_000));
+    assert_eq!(fixture.toss.confirm_calls(), 1);
+}
+
+#[tokio::test]
+async fn 웹훅_뒤에_승인_확인이_와도_같은_후원을_돌려주고_한_번만_적립된다() {
+    let fixture = DonationFixture::new().await;
+    let order = fixture.order(7_000, "").await;
+    let payment_key = fixture
+        .toss
+        .authorize(&order.order_id, 7_000, OnConfirm::Approve);
+    fixture.toss.set_status(&payment_key, "DONE");
+    fixture.webhook(&payment_key, "DONE").await;
+
+    // 늦게 도착한 성공 화면의 승인 확인. 결제 서비스는 이미 처리된 결제라고 답한다.
+    let reply = fixture.confirm(&payment_key, &order.order_id, 7_000).await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json::<Donation>().amount, 7_000);
+    assert_eq!(fixture.confirmed_total().await, (1, 7_000));
+}
+
+#[tokio::test]
+async fn 웹훅_본문이_완료라고_해도_조회한_결제가_끝나지_않았으면_확정하지_않는다() {
+    let fixture = DonationFixture::new().await;
+    let order = fixture.order(7_000, "").await;
+    // 결제창 인증만 끝나고 승인되지 않은 결제. 누군가 본문을 꾸며 DONE이라고 보냈다.
+    let payment_key = fixture
+        .toss
+        .authorize(&order.order_id, 7_000, OnConfirm::Approve);
+
+    let reply = fixture.webhook(&payment_key, "DONE").await;
+
+    assert_eq!(webhook_result(&reply), "ignored");
+    assert_eq!(fixture.status(&order.order_id).await, "pending");
+    assert_eq!(fixture.confirmed_total().await, (0, 0));
+}
+
+#[tokio::test]
+async fn 조회한_결제_금액이_주문과_다르면_웹훅으로도_확정하지_않는다() {
+    let fixture = DonationFixture::new().await;
+    let order = fixture.order(7_000, "").await;
+    // 같은 주문번호로 다른 금액이 결제된 경우.
+    let payment_key = fixture
+        .toss
+        .authorize(&order.order_id, 100, OnConfirm::Approve);
+    fixture.toss.set_status(&payment_key, "DONE");
+
+    let reply = fixture.webhook(&payment_key, "DONE").await;
+
+    assert_eq!(webhook_result(&reply), "closed");
+    assert_eq!(fixture.status(&order.order_id).await, "failed");
+    assert_eq!(fixture.confirmed_total().await, (0, 0));
+}
+
+#[tokio::test]
+async fn 결제가_실패하거나_만료됐다는_웹훅은_주문을_끝낸다() {
+    let fixture = DonationFixture::new().await;
+    let aborted = fixture.order(7_000, "").await;
+    let canceled = fixture.order(7_000, "").await;
+    let aborted_key = fixture
+        .toss
+        .authorize(&aborted.order_id, 7_000, OnConfirm::Approve);
+    let canceled_key = fixture
+        .toss
+        .authorize(&canceled.order_id, 7_000, OnConfirm::Approve);
+    fixture.toss.set_status(&aborted_key, "EXPIRED");
+    fixture.toss.set_status(&canceled_key, "CANCELED");
+
+    assert_eq!(
+        webhook_result(&fixture.webhook(&aborted_key, "EXPIRED").await),
+        "closed"
+    );
+    assert_eq!(
+        webhook_result(&fixture.webhook(&canceled_key, "CANCELED").await),
+        "closed"
+    );
+
+    assert_eq!(fixture.status(&aborted.order_id).await, "failed");
+    assert_eq!(fixture.status(&canceled.order_id).await, "canceled");
+}
+
+#[tokio::test]
+async fn 모르는_결제와_다른_이벤트는_200으로_무시한다() {
+    let fixture = DonationFixture::new().await;
+
+    let unknown_payment = fixture.webhook("tgen_unknown", "DONE").await;
+    let other_event = fixture
+        .app
+        .request(
+            "POST",
+            PAYMENT_WEBHOOK_PATH,
+            None,
+            Some(json!({ "eventType": "DEPOSIT_CALLBACK", "data": {} })),
+        )
+        .await;
+
+    assert_eq!(webhook_result(&unknown_payment), "ignored");
+    assert_eq!(webhook_result(&other_event), "ignored");
+}
+
+#[tokio::test]
+async fn 결제_서비스에_물을_수_없으면_웹훅을_다시_보내도록_5xx로_답한다() {
+    let app = TestApp::with_config(|config| {
+        config.toss = Some(server::TossConfig {
+            client_key: CLIENT_KEY.into(),
+            secret_key: SECRET_KEY.into(),
+            // 아무도 듣지 않는 주소.
+            api_base: "http://127.0.0.1:9".into(),
+        });
+    })
+    .await;
+
+    let reply = app
+        .request(
+            "POST",
+            PAYMENT_WEBHOOK_PATH,
+            None,
+            Some(json!({ "eventType": "PAYMENT_STATUS_CHANGED", "data": { "paymentKey": "tgen_x" } })),
+        )
+        .await;
+
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
 }
