@@ -254,14 +254,14 @@ pub fn comment_path(broadcast_id: Uuid, comment_id: Uuid) -> String {
 
 /// 댓글 실시간 WebSocket 경로(읽기 전용, 로그인 불필요).
 ///
-/// 연결해 두면 그 방송에 댓글이 생기거나 지워질 때마다 서버가 [`CommentEvent`]를 보낸다.
+/// 연결해 두면 그 방송에 댓글이 생기거나 지워지거나 후원이 확정될 때마다 서버가 [`CommentEvent`]를 보낸다.
 /// 연결 전에 쓰인 댓글은 보내지 않으므로, 연결한 뒤 [`comments_path`]로 목록을 받아 채운다.
 /// 방송이 삭제되면 서버가 연결을 닫는다.
 pub fn comments_ws_path(broadcast_id: Uuid) -> String {
     format!("/api/broadcasts/{broadcast_id}/comments/ws")
 }
 
-/// 댓글 실시간 WebSocket으로 서버가 보내는 텍스트 메시지.
+/// 댓글 실시간 WebSocket(방송 알림 채널)으로 서버가 보내는 텍스트 메시지.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommentEvent {
@@ -269,4 +269,99 @@ pub enum CommentEvent {
     Created { comment: Comment },
     /// 댓글이 지워졌다.
     Deleted { comment_id: Uuid },
+    /// 후원이 확정되었다. 같은 후원에 대해 한 번만 온다.
+    Donated { donation: Donation },
 }
+
+/// 후원 금액 범위(원).
+pub const DONATION_MIN_AMOUNT: u64 = 1_000;
+pub const DONATION_MAX_AMOUNT: u64 = 1_000_000;
+/// 후원 화면의 금액 버튼(원).
+pub const DONATION_PRESET_AMOUNTS: [u64; 3] = [1_000, 5_000, 10_000];
+/// 후원 메시지의 최대 글자 수(앞뒤 공백 제거 후).
+pub const DONATION_MESSAGE_MAX_CHARS: usize = 100;
+
+/// 후원 주문 요청. 로그인한 시청자가 라이브 중인 방송에 보낸다. 받는 사람은 서버가 방송 소유자로 정한다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewDonation {
+    pub amount: u64,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// 만들어진 후원 주문. 웹은 이 값으로 토스페이먼츠 결제창을 연다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DonationOrder {
+    /// 주문번호. 결제창과 승인 확인에 그대로 쓴다.
+    pub order_id: String,
+    pub broadcast_id: Uuid,
+    pub amount: u64,
+    /// 결제창에 보이는 주문 이름.
+    pub order_name: String,
+    /// 후원을 받는 방송자(주문 시점의 방송 소유자).
+    pub recipient: User,
+    /// 토스페이먼츠 결제창 SDK의 클라이언트 키.
+    pub client_key: String,
+    /// 토스페이먼츠 고객 키(후원자를 가리키는 무작위가 아닌 고정 값).
+    pub customer_key: String,
+}
+
+/// 결제 승인 확인 요청. 결제창이 성공 주소로 돌려준 쿼리 값을 그대로 담는다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfirmDonation {
+    pub payment_key: String,
+    pub order_id: String,
+    pub amount: u64,
+}
+
+/// 확정된 후원.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Donation {
+    /// 주문번호. 후원 하나를 가리킨다.
+    pub order_id: String,
+    pub broadcast_id: Uuid,
+    pub donor: User,
+    pub recipient: User,
+    pub amount: u64,
+    pub message: String,
+    pub confirmed_at: DateTime<Utc>,
+}
+
+/// 방송의 후원 주문(POST, 로그인 필요)과 후원 내역(GET, 공개) API 경로.
+pub fn donations_path(broadcast_id: Uuid) -> String {
+    format!("/api/broadcasts/{broadcast_id}/donations")
+}
+
+/// 결제 승인 확인 API 경로(로그인 필요, 주문한 사용자만).
+pub const DONATION_CONFIRM_PATH: &str = "/api/donations/confirm";
+
+/// 결제 실패·취소 통지. 결제창의 실패 주소가 돌려준 코드와 메시지를 담는다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DonationFailure {
+    pub order_id: String,
+    /// 토스페이먼츠 오류 코드. 사용자가 취소하면 `PAY_PROCESS_CANCELED`(또는 SDK의 `USER_CANCEL`).
+    pub code: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// 결제 실패·취소 통지 API 경로(로그인 필요, 주문한 사용자만).
+pub const DONATION_FAIL_PATH: &str = "/api/donations/fail";
+
+/// 토스페이먼츠 결제 상태 웹훅을 받는 경로(공개). 개발자센터 > 웹훅에 `https://<주소>/api/payments/toss/webhook`으로 등록한다.
+/// 본문은 믿지 않고 결제 조회 API로 다시 확인한다.
+pub const PAYMENT_WEBHOOK_PATH: &str = "/api/payments/toss/webhook";
+
+/// 방송의 후원 내역과 합계(공개). 확정된 후원만 센다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DonationSummary {
+    /// 확정된 후원 금액의 합(원).
+    pub total_amount: u64,
+    /// 확정된 후원 수.
+    pub count: u64,
+    /// 최근 후원부터. 많으면 최근 [`DONATION_LIST_LIMIT`]건만 담는다(합계와 건수는 전체).
+    pub donations: Vec<Donation>,
+}
+
+/// 후원 내역에 담는 최대 건수.
+pub const DONATION_LIST_LIMIT: usize = 100;

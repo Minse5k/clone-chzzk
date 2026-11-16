@@ -3,10 +3,11 @@
 use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::{Deserialize, de::DeserializeOwned};
 use shared::{
-    AuthResponse, Broadcast, Comment, Credentials, LOGIN_PATH, LOGOUT_PATH, ME_PATH, NewComment,
-    SIGNUP_PATH, UPLOAD_POLICY_PATH, UpdateBroadcast, UploadPolicy, User, broadcast_end_path,
-    broadcast_path, comment_path, comments_path, live_playlist_path, recording_path,
-    registration_fields,
+    AuthResponse, Broadcast, Comment, ConfirmDonation, Credentials, DONATION_CONFIRM_PATH,
+    DONATION_FAIL_PATH, Donation, DonationFailure, DonationOrder, DonationSummary, LOGIN_PATH,
+    LOGOUT_PATH, ME_PATH, NewComment, NewDonation, SIGNUP_PATH, UPLOAD_POLICY_PATH,
+    UpdateBroadcast, UploadPolicy, User, broadcast_end_path, broadcast_path, comment_path,
+    comments_path, donations_path, live_playlist_path, recording_path, registration_fields,
 };
 use uuid::Uuid;
 use web_sys::{File, FormData};
@@ -204,6 +205,55 @@ pub async fn delete_comment(broadcast_id: Uuid, comment_id: Uuid) -> ApiResult<(
     .send()
     .await
     .map_err(|_| "서버에 연결할 수 없습니다.".to_owned())?;
+    if response.ok() {
+        Ok(())
+    } else {
+        Err(error_message(response).await)
+    }
+}
+
+/// 후원 주문을 만든다(로그인 필요). 받는 사람은 서버가 방송 소유자로 정한다.
+pub async fn create_donation_order(
+    broadcast_id: Uuid,
+    amount: u64,
+    message: &str,
+) -> ApiResult<DonationOrder> {
+    let request = authorized(Request::post(&url(&donations_path(broadcast_id))))
+        .json(&NewDonation {
+            amount,
+            message: message.to_owned(),
+        })
+        .map_err(|_| "요청을 준비할 수 없습니다.".to_owned())?;
+    read_json(request.send().await).await
+}
+
+/// 결제창이 성공 주소로 돌려준 값으로 서버에 결제 승인 확인을 요청한다. 서버가 확인해야 후원이 확정된다.
+pub async fn confirm_donation(request: &ConfirmDonation) -> ApiResult<Donation> {
+    let request = authorized(Request::post(&url(DONATION_CONFIRM_PATH)))
+        .json(request)
+        .map_err(|_| "요청을 준비할 수 없습니다.".to_owned())?;
+    read_json(request.send().await).await
+}
+
+/// 방송의 후원 내역과 합계(공개).
+pub async fn donation_summary(broadcast_id: Uuid) -> ApiResult<DonationSummary> {
+    read_json(
+        Request::get(&url(&donations_path(broadcast_id)))
+            .send()
+            .await,
+    )
+    .await
+}
+
+/// 결제 실패·취소를 서버에 알려 결제 대기 주문을 끝낸다.
+pub async fn fail_donation(failure: &DonationFailure) -> ApiResult<()> {
+    let request = authorized(Request::post(&url(DONATION_FAIL_PATH)))
+        .json(failure)
+        .map_err(|_| "요청을 준비할 수 없습니다.".to_owned())?;
+    let response = request
+        .send()
+        .await
+        .map_err(|_| "서버에 연결할 수 없습니다.".to_owned())?;
     if response.ok() {
         Ok(())
     } else {

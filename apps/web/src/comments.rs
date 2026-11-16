@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 use futures_channel::mpsc::{UnboundedSender, unbounded};
 use futures_util::StreamExt;
 use gloo_timers::future::TimeoutFuture;
-use shared::{COMMENT_MAX_CHARS, Comment, CommentEvent, comments_ws_path};
+use shared::{COMMENT_MAX_CHARS, Comment, CommentEvent, Donation, comments_ws_path};
 use uuid::Uuid;
 use wasm_bindgen::{JsCast, closure::Closure};
 use web_sys::{CloseEvent, MessageEvent, WebSocket};
@@ -16,7 +16,13 @@ const RECONNECT_MILLIS: u32 = 3000;
 
 /// 방송의 댓글 목록과 작성란. 목록은 누구나 보고, 작성은 로그인한 사용자, 삭제는 작성자만 한다.
 #[component]
-pub fn CommentSection(broadcast_id: Uuid) -> Element {
+pub fn CommentSection(
+    broadcast_id: Uuid,
+    /// 실시간 연결이 (다시) 열렸다. 연결이 끊긴 동안 놓친 후원도 다시 받게 한다.
+    on_feed_opened: EventHandler<()>,
+    /// 후원이 확정되었다는 실시간 알림.
+    on_donation: EventHandler<Donation>,
+) -> Element {
     let comments = use_signal(Vec::<Comment>::new);
     let load_error = use_signal(|| None::<String>);
     let mut draft = use_signal(String::new);
@@ -35,7 +41,13 @@ pub fn CommentSection(broadcast_id: Uuid) -> Element {
             }
             while let Some(event) = events.next().await {
                 match event {
-                    FeedEvent::Opened => refresh(broadcast_id, comments, load_error).await,
+                    FeedEvent::Opened => {
+                        on_feed_opened.call(());
+                        refresh(broadcast_id, comments, load_error).await
+                    }
+                    FeedEvent::Comment(CommentEvent::Donated { donation }) => {
+                        on_donation.call(donation)
+                    }
                     FeedEvent::Comment(CommentEvent::Created { comment }) => {
                         add_comment(comments, comment)
                     }

@@ -138,6 +138,9 @@ OCI_SECRET_ACCESS_KEY=<Secret Key>
 SITE_ADDRESS=<공인IP를 대시로>.sslip.io
 # 로그인 토큰 서명 키. 아래 명령으로 만든 값을 넣는다(저장소에 커밋하지 않는다).
 JWT_SECRET=<openssl rand -base64 48 결과>
+# 후원 결제: 토스페이먼츠 결제위젯 테스트 키(test_로 시작). 라이브 키는 넣지 않는다.
+TOSS_CLIENT_KEY=<테스트 클라이언트 키>
+TOSS_SECRET_KEY=<테스트 시크릿 키>
 ```
 
 > `JWT_SECRET`은 VM에서 `openssl rand -base64 48`로 만든다. 비워 두면 서버가 시작할 때마다 임시 키를 만들어, 재배포·재시작할 때마다 모든 사용자가 로그아웃된다.
@@ -176,6 +179,12 @@ docker compose logs -f app
 3. PC 브라우저에서 방송 목록을 열면 **라이브 중**에 방송이 보인다. 눌러서 3~6초 지연으로 시청한다.
 4. 휴대폰에서 **방송 종료** → PC 화면이 `종료`로 바뀌고, 잠시 뒤 녹화본으로 다시 볼 수 있다.
 5. OCI 버킷에 그 방송의 `recordings/<방송 ID>.mp4`가 생겼는지 확인한다.
+
+도네이션(과제 4)
+
+1. A가 휴대폰으로 송출하는 동안 B가 PC에서 그 방송 상세의 **후원하기**로 테스트 결제를 마친다 → 성공 화면과 A·B 화면의 후원 내역·합계가 바뀐다.
+2. 토스페이먼츠 [개발자센터 > 웹훅](https://developers.tosspayments.com/my/webhook)에 `https://<공인IP를 대시로>.sslip.io/api/payments/toss/webhook`을 `PAYMENT_STATUS_CHANGED`로 등록한다(가입해 받은 테스트 키일 때). 결제 후 웹훅 기록의 **다시 시도**로 같은 통지를 보내도 합계가 늘지 않는다.
+3. 나머지는 README의 [직접 확인 절차 > 과제 4](../README.md#과제-4-도네이션-테스트-결제-성공실패취소-승인-통지-중복)를 따르고 `API=`만 이 주소로 바꾼다.
 
 인증·인가와 댓글(과제 3)
 

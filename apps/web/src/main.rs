@@ -2,6 +2,7 @@
 
 mod api;
 mod comments;
+mod donations;
 mod live;
 mod session;
 
@@ -38,6 +39,10 @@ enum Route {
     Login { next: String },
     #[route("/signup?:next")]
     Signup { next: String },
+    #[route("/donations/success?:..query")]
+    DonationSuccess { query: String },
+    #[route("/donations/fail?:..query")]
+    DonationFail { query: String },
     #[route("/:..segments")]
     PageNotFound { segments: Vec<String> },
 }
@@ -111,6 +116,16 @@ fn AccountMenu() -> Element {
             }
         }
     }
+}
+
+#[component]
+fn DonationSuccess(query: String) -> Element {
+    rsx! { donations::DonationSuccess { query } }
+}
+
+#[component]
+fn DonationFail(query: String) -> Element {
+    rsx! { donations::DonationFail { query } }
 }
 
 #[component]
@@ -343,6 +358,9 @@ const LIVE_REFRESH_MILLIS: u32 = 3000;
 #[component]
 fn BroadcastDetail(id: ReadSignal<String>) -> Element {
     let mut broadcast = use_resource(move || async move { api::get_broadcast(&id()).await });
+    // 실시간으로 받은 후원과, 후원 내역을 다시 받을 때 올리는 번호. 댓글 실시간 연결이 함께 쓴다.
+    let mut realtime_donations = use_signal(Vec::<shared::Donation>::new);
+    let mut donations_version = use_signal(|| 0u32);
 
     // 라이브 중이거나 녹화본을 만드는 중인 방송은 주기적으로 다시 불러온다.
     // 다시 불러오는 동안에도 이전 값이 남아 있어 플레이어가 다시 만들어지지 않는다.
@@ -410,7 +428,19 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
                     broadcast: broadcast.clone(),
                     on_changed: move |_| reload.restart(),
                 }
-                comments::CommentSection { key: "{broadcast.id}", broadcast_id: broadcast.id }
+                donations::DonationPanel { broadcast: broadcast.clone() }
+                donations::DonationHistory {
+                    key: "{broadcast.id}",
+                    broadcast_id: broadcast.id,
+                    realtime: realtime_donations,
+                    version: donations_version,
+                }
+                comments::CommentSection {
+                    key: "{broadcast.id}",
+                    broadcast_id: broadcast.id,
+                    on_feed_opened: move |_| donations_version += 1,
+                    on_donation: move |donation| realtime_donations.write().push(donation),
+                }
             }
         },
     }

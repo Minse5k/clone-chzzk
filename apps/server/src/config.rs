@@ -29,6 +29,51 @@ pub struct Config {
     pub jwt_secret: Option<JwtSecret>,
     /// 로그인 토큰의 유효 시간.
     pub jwt_ttl: Duration,
+    /// 후원 결제에 쓰는 토스페이먼츠 테스트 키. 없으면 후원만 막고 나머지 기능은 그대로 쓴다.
+    pub toss: Option<TossConfig>,
+}
+
+/// 토스페이먼츠 설정. 테스트 키(`test_`로 시작)만 쓴다.
+#[derive(Clone)]
+pub struct TossConfig {
+    /// 결제창 SDK를 초기화하는 클라이언트 키. 웹에 내려 준다.
+    pub client_key: String,
+    /// 결제 승인·조회 API를 부르는 시크릿 키. 서버에만 둔다.
+    pub secret_key: String,
+    /// 결제 API 주소. 기본 `https://api.tosspayments.com`, 테스트에서는 가짜 결제 서버 주소.
+    pub api_base: String,
+}
+
+impl std::fmt::Debug for TossConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TossConfig")
+            .field("client_key", &self.client_key)
+            .field("secret_key", &"<숨김>")
+            .field("api_base", &self.api_base)
+            .finish()
+    }
+}
+
+impl TossConfig {
+    fn from_env() -> anyhow::Result<Option<Self>> {
+        let client_key = env::var("TOSS_CLIENT_KEY")
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let secret_key = env::var("TOSS_SECRET_KEY")
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        match (client_key.is_empty(), secret_key.is_empty()) {
+            (true, true) => Ok(None),
+            (false, false) => Ok(Some(Self {
+                client_key,
+                secret_key,
+                api_base: env_or("TOSS_API_BASE", "https://api.tosspayments.com"),
+            })),
+            _ => anyhow::bail!("TOSS_CLIENT_KEY와 TOSS_SECRET_KEY는 함께 지정해야 합니다"),
+        }
+    }
 }
 
 /// 로그인 토큰 서명 키. 로그나 디버그 출력에 값이 드러나지 않게 감싼다.
@@ -145,6 +190,7 @@ impl Config {
                 .filter(|secret| !secret.is_empty())
                 .map(JwtSecret),
             jwt_ttl: Duration::from_secs(env_number("JWT_TTL_SECS", 24 * 60 * 60)?),
+            toss: TossConfig::from_env()?,
         })
     }
 }

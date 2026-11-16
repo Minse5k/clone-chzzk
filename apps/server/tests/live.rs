@@ -74,6 +74,7 @@ impl LiveServer {
             live_idle_timeout: Duration::from_secs(20),
             jwt_secret: Some(TEST_JWT_SECRET.into()),
             jwt_ttl: std::time::Duration::from_secs(3600),
+            toss: None,
         }
     }
 
