@@ -5,7 +5,9 @@ mod auth;
 mod comments;
 mod config;
 mod db;
+mod donations;
 mod live;
+mod payments;
 mod range;
 mod storage;
 
@@ -21,7 +23,9 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-pub use config::{Config, JwtSecret, OciStorageConfig, StorageConfig, server_addr_from_env};
+pub use config::{
+    Config, JwtSecret, OciStorageConfig, StorageConfig, TossConfig, server_addr_from_env,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -31,6 +35,8 @@ pub struct AppState {
     pub live: Arc<live::LiveCapacity>,
     pub auth: Arc<auth::AuthKeys>,
     pub comments: Arc<comments::CommentHub>,
+    /// 후원 결제. 토스페이먼츠 키를 설정하지 않았으면 `None`이고 후원만 막는다.
+    pub payments: Option<Arc<payments::TossPayments>>,
 }
 
 /// 설정으로 DB와 저장소를 준비하고 HTTP 라우터를 만든다.
@@ -45,6 +51,15 @@ pub async fn build_app(config: Config) -> anyhow::Result<Router> {
     };
     let live = live::LiveCapacity::check(&config).await;
     let auth = auth::AuthKeys::new(&config);
+    let payments = match &config.toss {
+        Some(toss) => Some(Arc::new(payments::TossPayments::new(toss)?)),
+        None => {
+            tracing::warn!(
+                "TOSS_CLIENT_KEY·TOSS_SECRET_KEY가 없어 후원 결제를 받지 않습니다. 다른 기능은 그대로 동작합니다"
+            );
+            None
+        }
+    };
     let state = AppState {
         db,
         store: Arc::new(store),
@@ -52,6 +67,7 @@ pub async fn build_app(config: Config) -> anyhow::Result<Router> {
         live: Arc::new(live),
         auth: Arc::new(auth),
         comments: Arc::default(),
+        payments,
     };
     // 서버가 송출 도중에 멈췄다면 라이브 중으로 남은 방송을 정리한다.
     live::recover(&state).await?;

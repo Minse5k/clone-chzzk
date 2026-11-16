@@ -293,3 +293,26 @@ button.link {
     font-weight: 400;
     text-decoration: underline;
 }
+
+.donation-panel {
+    margin-top: 24px;
+    padding: 16px;
+    border: 1px solid var(--live);
+    border-radius: 8px;
+}
+
+.donation-form { display: flex; flex-direction: column; gap: 6px; }
+.donation-form label { font-weight: 700; margin-top: 8px; }
+.donation-form input {
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+}
+.donation-form button[type="submit"] { margin-top: 12px; align-self: flex-start; }
+.amount-presets { margin-top: 4px; }
+.donation-checkout { display: flex; flex-direction: column; gap: 8px; }
+.donation-checkout #toss-payment-methods,
+.donation-checkout #toss-agreement { background: #fff; border-radius: 8px; }

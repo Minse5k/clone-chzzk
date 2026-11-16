@@ -36,6 +36,7 @@ pub fn test_config(dir: &TempDir) -> server::Config {
         live_idle_timeout: std::time::Duration::from_secs(20),
         jwt_secret: Some(TEST_JWT_SECRET.into()),
         jwt_ttl: std::time::Duration::from_secs(3600),
+        toss: None,
     }
 }
 
@@ -120,6 +121,32 @@ impl TestApp {
         let reply = self.request("POST", SIGNUP_PATH, None, Some(body)).await;
         assert_eq!(reply.status, StatusCode::CREATED, "{username} 가입 실패");
         reply.json()
+    }
+
+    /// 라이브 중인(종료 시각이 없는) 방송을 DB에 직접 만든다. 송출 없이 라이브 상태가 필요한 테스트의 준비용.
+    pub async fn insert_live_broadcast(&self, owner: &AuthResponse, title: &str) -> Uuid {
+        let id = Uuid::now_v7();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let pool = self.pool().await;
+        sqlx::query("INSERT INTO broadcasts (id, title, owner_id, created_at) VALUES (?, ?, ?, ?)")
+            .bind(id.to_string())
+            .bind(title)
+            .bind(owner.user.id.to_string())
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        id
+    }
+
+    /// 테스트 DB에 직접 연결한다.
+    pub async fn pool(&self) -> sqlx::SqlitePool {
+        sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(self.dir.path().join("test.db")),
+        )
+        .await
+        .unwrap()
     }
 
     /// 녹화본 없이 종료된 방송을 DB에 직접 만든다. 방송 등록·송출 경로와 상관없는 테스트의 준비용.

@@ -2,6 +2,7 @@
 
 mod api;
 mod comments;
+mod donations;
 mod live;
 mod session;
 
@@ -38,6 +39,8 @@ enum Route {
     Login { next: String },
     #[route("/signup?:next")]
     Signup { next: String },
+    #[route("/donations/success?:..query")]
+    DonationSuccess { query: String },
     #[route("/:..segments")]
     PageNotFound { segments: Vec<String> },
 }
@@ -111,6 +114,11 @@ fn AccountMenu() -> Element {
             }
         }
     }
+}
+
+#[component]
+fn DonationSuccess(query: String) -> Element {
+    rsx! { donations::DonationSuccess { query } }
 }
 
 #[component]
@@ -410,6 +418,7 @@ fn BroadcastDetail(id: ReadSignal<String>) -> Element {
                     broadcast: broadcast.clone(),
                     on_changed: move |_| reload.restart(),
                 }
+                donations::DonationPanel { broadcast: broadcast.clone() }
                 comments::CommentSection { key: "{broadcast.id}", broadcast_id: broadcast.id }
             }
         },

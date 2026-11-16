@@ -389,6 +389,8 @@ pub enum DeleteOutcome {
     Deleted(Option<RecordingLocation>),
     /// 라이브 중이라 지우지 않았다.
     Live,
+    /// 확정된 후원이 있어 지우지 않았다. 후원 내역은 돈이 오간 기록이라 남긴다.
+    HasDonations,
     NotFound,
 }
 
@@ -406,6 +408,20 @@ pub async fn delete_broadcast(pool: &SqlitePool, id: Uuid) -> anyhow::Result<Del
         Some(None) => return Ok(DeleteOutcome::Live),
         Some(Some(_)) => {}
     }
+    let confirmed_donations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM donations WHERE broadcast_id = ? AND status = 'confirmed'",
+    )
+    .bind(&id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if confirmed_donations > 0 {
+        return Ok(DeleteOutcome::HasDonations);
+    }
+    // 확정되지 않은 주문(결제 대기·실패·취소)은 방송과 함께 지운다.
+    sqlx::query("DELETE FROM donations WHERE broadcast_id = ?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
     let location: Option<(String, String)> = sqlx::query_as(
         "DELETE FROM recordings WHERE broadcast_id = ? RETURNING storage_backend, object_key",
     )
@@ -556,4 +572,215 @@ pub async fn delete_comment(pool: &SqlitePool, comment_id: Uuid) -> anyhow::Resu
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// 후원 주문의 상태.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DonationStatus {
+    /// 결제 대기. 결제창에서 결제 중이거나 승인 확인을 기다린다.
+    Pending,
+    /// 결제가 승인되어 확정된 후원.
+    Confirmed,
+    Failed,
+    Canceled,
+}
+
+impl DonationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Confirmed => "confirmed",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+        }
+    }
+
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        Ok(match value {
+            "pending" => Self::Pending,
+            "confirmed" => Self::Confirmed,
+            "failed" => Self::Failed,
+            "canceled" => Self::Canceled,
+            other => anyhow::bail!("알 수 없는 후원 상태: {other}"),
+        })
+    }
+}
+
+/// DB에 저장된 후원 주문.
+#[derive(Debug, Clone)]
+pub struct StoredDonation {
+    pub order_id: String,
+    pub broadcast_id: Uuid,
+    pub donor: shared::User,
+    pub recipient: shared::User,
+    pub amount: u64,
+    pub message: String,
+    pub status: DonationStatus,
+    pub payment_key: Option<String>,
+    pub confirmed_at: Option<DateTime<Utc>>,
+}
+
+impl StoredDonation {
+    /// 확정된 후원이면 API로 내보내는 값.
+    pub fn confirmed(&self) -> Option<shared::Donation> {
+        if self.status != DonationStatus::Confirmed {
+            return None;
+        }
+        Some(shared::Donation {
+            order_id: self.order_id.clone(),
+            broadcast_id: self.broadcast_id,
+            donor: self.donor.clone(),
+            recipient: self.recipient.clone(),
+            amount: self.amount,
+            message: self.message.clone(),
+            confirmed_at: self.confirmed_at?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct DonationRow {
+    order_id: String,
+    broadcast_id: String,
+    donor_id: String,
+    donor_username: String,
+    recipient_id: String,
+    recipient_username: String,
+    amount: i64,
+    message: String,
+    status: String,
+    payment_key: Option<String>,
+    confirmed_at: Option<String>,
+}
+
+impl TryFrom<DonationRow> for StoredDonation {
+    type Error = anyhow::Error;
+
+    fn try_from(row: DonationRow) -> anyhow::Result<Self> {
+        Ok(Self {
+            order_id: row.order_id,
+            broadcast_id: Uuid::parse_str(&row.broadcast_id)?,
+            donor: shared::User {
+                id: Uuid::parse_str(&row.donor_id)?,
+                username: row.donor_username,
+            },
+            recipient: shared::User {
+                id: Uuid::parse_str(&row.recipient_id)?,
+                username: row.recipient_username,
+            },
+            amount: row.amount.try_into()?,
+            message: row.message,
+            status: DonationStatus::parse(&row.status)?,
+            payment_key: row.payment_key,
+            confirmed_at: row.confirmed_at.as_deref().map(parse_time).transpose()?,
+        })
+    }
+}
+
+const SELECT_DONATIONS: &str = "\
+    SELECT d.order_id, d.broadcast_id, d.donor_id, donor.username AS donor_username, \
+           d.recipient_id, recipient.username AS recipient_username, d.amount, d.message, \
+           d.status, d.payment_key, d.confirmed_at \
+    FROM donations d \
+    JOIN users donor ON donor.id = d.donor_id \
+    JOIN users recipient ON recipient.id = d.recipient_id";
+
+/// 결제 대기 상태의 후원 주문을 만든다.
+pub async fn insert_donation_order(
+    pool: &SqlitePool,
+    order: &StoredDonation,
+    created_at: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO donations \
+         (order_id, broadcast_id, recipient_id, donor_id, amount, message, status, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+    )
+    .bind(&order.order_id)
+    .bind(order.broadcast_id.to_string())
+    .bind(order.recipient.id.to_string())
+    .bind(order.donor.id.to_string())
+    .bind(i64::try_from(order.amount)?)
+    .bind(&order.message)
+    .bind(format_time(created_at))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn find_donation(
+    pool: &SqlitePool,
+    order_id: &str,
+) -> anyhow::Result<Option<StoredDonation>> {
+    sqlx::query_as::<_, DonationRow>(sqlx::AssertSqlSafe(format!(
+        "{SELECT_DONATIONS} WHERE d.order_id = ?"
+    )))
+    .bind(order_id)
+    .fetch_optional(pool)
+    .await?
+    .map(StoredDonation::try_from)
+    .transpose()
+}
+
+/// 후원 확정 시도의 결과.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConfirmOutcome {
+    /// 이번 요청으로 새로 확정했다. 실시간 알림은 이때만 보낸다.
+    Confirmed,
+    /// 결제 대기 상태가 아니어서 바꾸지 않았다(이미 확정, 실패, 취소).
+    NotPending,
+    /// 같은 결제 키로 이미 다른 주문이 확정되어 있다.
+    PaymentKeyTaken,
+}
+
+/// 결제 대기 중인 주문을 확정한다. 같은 주문에 승인 확인과 웹훅이 여러 번 와도
+/// `status = 'pending'` 조건 때문에 한 번만 확정되고, 결제 키 유일 제약 때문에
+/// 같은 결제가 두 주문에 확정되지도 않는다.
+pub async fn confirm_donation(
+    pool: &SqlitePool,
+    order_id: &str,
+    payment_key: &str,
+    confirmed_at: DateTime<Utc>,
+) -> anyhow::Result<ConfirmOutcome> {
+    let result = sqlx::query(
+        "UPDATE donations SET status = 'confirmed', payment_key = ?, confirmed_at = ? \
+         WHERE order_id = ? AND status = 'pending'",
+    )
+    .bind(payment_key)
+    .bind(format_time(confirmed_at))
+    .bind(order_id)
+    .execute(pool)
+    .await;
+    match result {
+        Ok(result) if result.rows_affected() == 1 => Ok(ConfirmOutcome::Confirmed),
+        Ok(_) => Ok(ConfirmOutcome::NotPending),
+        Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+            Ok(ConfirmOutcome::PaymentKeyTaken)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// 결제 대기 중인 주문을 실패나 취소로 끝낸다. 이미 확정된 주문은 바꾸지 않는다.
+/// 바꿨으면 `true`.
+pub async fn close_donation(
+    pool: &SqlitePool,
+    order_id: &str,
+    status: DonationStatus,
+    reason: &str,
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        matches!(status, DonationStatus::Failed | DonationStatus::Canceled),
+        "후원 주문은 실패나 취소로만 끝낼 수 있습니다"
+    );
+    let result = sqlx::query(
+        "UPDATE donations SET status = ?, failure_reason = ? \
+         WHERE order_id = ? AND status = 'pending'",
+    )
+    .bind(status.as_str())
+    .bind(reason)
+    .bind(order_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }

@@ -23,7 +23,7 @@ use crate::{
     auth::{self, AuthUser},
     comments,
     db::{self, DeleteOutcome, InsertError, NewBroadcast, RecordingLocation},
-    live,
+    donations, live,
     range::{self, RangeRequest},
     storage::ByteRange,
 };
@@ -50,6 +50,7 @@ pub fn router() -> Router<AppState> {
         .route(LIVE_INGEST_PATH, any(live::ingest))
         .merge(auth::router())
         .merge(comments::router())
+        .merge(donations::router())
         // 웹 정적 파일 대체 응답이 없는 API 경로를 가로채지 않도록 먼저 404로 답한다.
         .route("/api/{*rest}", any(unknown_api))
 }
@@ -131,6 +132,12 @@ async fn delete_broadcast(
     let location = match db::delete_broadcast(&state.db, id).await? {
         DeleteOutcome::Deleted(location) => location,
         DeleteOutcome::Live => return Err(still_live()),
+        DeleteOutcome::HasDonations => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "후원을 받은 방송은 후원 내역을 지키기 위해 삭제할 수 없습니다.",
+            ));
+        }
         DeleteOutcome::NotFound => return Err(broadcast_not_found()),
     };
     tracing::info!(broadcast = %id, "방송 삭제: {}", stored.broadcast.title);
