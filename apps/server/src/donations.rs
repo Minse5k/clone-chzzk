@@ -15,8 +15,9 @@ use axum::{
 };
 use chrono::Utc;
 use shared::{
-    BroadcastStatus, ConfirmDonation, DONATION_CONFIRM_PATH, DONATION_MAX_AMOUNT,
-    DONATION_MESSAGE_MAX_CHARS, DONATION_MIN_AMOUNT, Donation, DonationOrder, NewDonation,
+    BroadcastStatus, ConfirmDonation, DONATION_CONFIRM_PATH, DONATION_FAIL_PATH,
+    DONATION_MAX_AMOUNT, DONATION_MESSAGE_MAX_CHARS, DONATION_MIN_AMOUNT, Donation,
+    DonationFailure, DonationOrder, NewDonation,
 };
 use uuid::Uuid;
 
@@ -32,7 +33,11 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/broadcasts/{id}/donations", post(create_order))
         .route(DONATION_CONFIRM_PATH, post(confirm))
+        .route(DONATION_FAIL_PATH, post(fail))
 }
+
+/// 사용자가 결제창에서 취소했다는 오류 코드. 결제창(`failUrl`)과 SDK가 각각 쓴다.
+const CANCEL_CODES: [&str; 2] = ["PAY_PROCESS_CANCELED", "USER_CANCEL"];
 
 /// 후원 주문 생성. 로그인한 사용자가 라이브 중인 남의 방송에만 후원할 수 있다.
 /// 받는 사람은 클라이언트가 아니라 서버가 방송 소유자로 정한다.
@@ -131,6 +136,16 @@ async fn confirm(
         return Err(bad_request(reason));
     }
 
+    // 결제 인증과 승인 사이에 방송이 끝났다. 승인하지 않으면 결제 인증은 만료되어 돈이 나가지 않는다.
+    let broadcast_live = db::find_broadcast(&state.db, order.broadcast_id)
+        .await?
+        .is_some_and(|stored| stored.broadcast.status == BroadcastStatus::Live);
+    if !broadcast_live {
+        let reason = "방송이 끝나 결제를 승인하지 않았습니다. 돈은 나가지 않습니다.";
+        close(&state, &order, DonationStatus::Canceled, reason).await?;
+        return Err(conflict(reason));
+    }
+
     let payment = match payments
         .confirm(&request.payment_key, &order.order_id, order.amount)
         .await
@@ -152,6 +167,36 @@ async fn confirm(
 
     let donation = finalize(&state, &order, &payment).await?;
     Ok(Json(donation))
+}
+
+/// 결제 실패·취소 통지. 결제창의 실패 주소(또는 결제창을 닫은 웹)가 보낸다.
+/// 결제 대기 중인 주문만 실패·취소로 끝내고, 이미 확정된 후원은 바꾸지 않는다.
+async fn fail(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(failure): Json<DonationFailure>,
+) -> Result<StatusCode, ApiError> {
+    let order = find_own_order(&state, &failure.order_id, &auth).await?;
+    match order.status {
+        DonationStatus::Pending => {
+            let (status, reason) = if CANCEL_CODES.contains(&failure.code.as_str()) {
+                (
+                    DonationStatus::Canceled,
+                    "사용자가 결제를 취소했습니다.".to_owned(),
+                )
+            } else {
+                (
+                    DonationStatus::Failed,
+                    format!("결제 실패({}): {}", failure.code, failure.message),
+                )
+            };
+            close(&state, &order, status, &reason).await?;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        // 이미 실패·취소로 끝난 주문이다(같은 통지가 다시 왔다).
+        DonationStatus::Failed | DonationStatus::Canceled => Ok(StatusCode::NO_CONTENT),
+        DonationStatus::Confirmed => Err(conflict("이미 확정된 후원은 실패로 바꿀 수 없습니다.")),
+    }
 }
 
 /// 토스페이먼츠가 알려 준 결제 결과를 주문과 대조하고, 맞으면 후원을 확정한다.

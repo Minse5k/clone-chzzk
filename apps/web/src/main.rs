@@ -41,6 +41,8 @@ enum Route {
     Signup { next: String },
     #[route("/donations/success?:..query")]
     DonationSuccess { query: String },
+    #[route("/donations/fail?:..query")]
+    DonationFail { query: String },
     #[route("/:..segments")]
     PageNotFound { segments: Vec<String> },
 }
@@ -119,6 +121,11 @@ fn AccountMenu() -> Element {
 #[component]
 fn DonationSuccess(query: String) -> Element {
     rsx! { donations::DonationSuccess { query } }
+}
+
+#[component]
+fn DonationFail(query: String) -> Element {
+    rsx! { donations::DonationFail { query } }
 }
 
 #[component]

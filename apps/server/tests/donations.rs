@@ -17,7 +17,10 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::{Reply, TestApp};
 use serde_json::{Value, json};
-use shared::{AuthResponse, DONATION_CONFIRM_PATH, Donation, DonationOrder, donations_path};
+use shared::{
+    AuthResponse, DONATION_CONFIRM_PATH, DONATION_FAIL_PATH, Donation, DonationOrder,
+    donations_path,
+};
 use uuid::Uuid;
 
 const CLIENT_KEY: &str = "test_ck_fake_client_key";
@@ -262,6 +265,37 @@ impl DonationFixture {
     async fn confirm(&self, payment_key: &str, order_id: &str, amount: u64) -> Reply {
         let token = self.viewer.token.clone();
         self.confirm_as(&token, payment_key, order_id, amount).await
+    }
+
+    async fn fail_as(&self, token: Option<&str>, order_id: &str, code: &str) -> Reply {
+        self.app
+            .request(
+                "POST",
+                DONATION_FAIL_PATH,
+                token,
+                Some(json!({ "order_id": order_id, "code": code, "message": "테스트 실패" })),
+            )
+            .await
+    }
+
+    async fn fail(&self, order_id: &str, code: &str) -> Reply {
+        let token = self.viewer.token.clone();
+        self.fail_as(Some(&token), order_id, code).await
+    }
+
+    /// 방송자가 라이브를 끝낸다.
+    async fn end_broadcast(&self) {
+        let token = self.streamer.token.clone();
+        let reply = self
+            .app
+            .request(
+                "POST",
+                &format!("/api/broadcasts/{}/end", self.broadcast),
+                Some(&token),
+                None,
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK);
     }
 
     /// 주문의 현재 상태(DB 값).
@@ -611,4 +645,102 @@ async fn 후원을_받은_방송은_삭제할_수_없다() {
         reply.message(),
         "후원을 받은 방송은 후원 내역을 지키기 위해 삭제할 수 없습니다."
     );
+}
+
+#[tokio::test]
+async fn 결제창에서_취소하면_주문이_취소되고_후원은_생기지_않는다() {
+    let fixture = DonationFixture::new().await;
+    let order = fixture.order(5_000, "").await;
+
+    let reply = fixture.fail(&order.order_id, "PAY_PROCESS_CANCELED").await;
+
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    assert_eq!(fixture.status(&order.order_id).await, "canceled");
+    assert_eq!(fixture.confirmed_total().await, (0, 0));
+    // 같은 통지가 다시 와도 그대로다.
+    assert_eq!(
+        fixture
+            .fail(&order.order_id, "PAY_PROCESS_CANCELED")
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(fixture.status(&order.order_id).await, "canceled");
+}
+
+#[tokio::test]
+async fn 결제가_실패하면_주문이_실패로_남고_다시_승인_확인해도_확정되지_않는다() {
+    let fixture = DonationFixture::new().await;
+    let order = fixture.order(5_000, "").await;
+    let payment_key = fixture
+        .toss
+        .authorize(&order.order_id, 5_000, OnConfirm::Approve);
+
+    let reply = fixture.fail(&order.order_id, "REJECT_CARD_COMPANY").await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    assert_eq!(fixture.status(&order.order_id).await, "failed");
+
+    let confirm = fixture.confirm(&payment_key, &order.order_id, 5_000).await;
+    assert_eq!(confirm.status, StatusCode::CONFLICT);
+    assert_eq!(fixture.toss.confirm_calls(), 0);
+    assert_eq!(fixture.confirmed_total().await, (0, 0));
+}
+
+#[tokio::test]
+async fn 확정된_후원은_실패_통지로_바뀌지_않는다() {
+    let fixture = DonationFixture::new().await;
+    let order = fixture.order(5_000, "").await;
+    let payment_key = fixture
+        .toss
+        .authorize(&order.order_id, 5_000, OnConfirm::Approve);
+    fixture.confirm(&payment_key, &order.order_id, 5_000).await;
+
+    let reply = fixture.fail(&order.order_id, "PAY_PROCESS_CANCELED").await;
+
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert_eq!(fixture.status(&order.order_id).await, "confirmed");
+    assert_eq!(fixture.confirmed_total().await, (1, 5_000));
+}
+
+#[tokio::test]
+async fn 남의_주문은_실패로_바꿀_수_없다() {
+    let fixture = DonationFixture::new().await;
+    let order = fixture.order(5_000, "").await;
+    let stranger = fixture.app.signup("stranger").await;
+
+    let other = fixture
+        .fail_as(
+            Some(&stranger.token),
+            &order.order_id,
+            "PAY_PROCESS_CANCELED",
+        )
+        .await;
+    let anonymous = fixture
+        .fail_as(None, &order.order_id, "PAY_PROCESS_CANCELED")
+        .await;
+
+    assert_eq!(other.status, StatusCode::FORBIDDEN);
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(fixture.status(&order.order_id).await, "pending");
+}
+
+#[tokio::test]
+async fn 결제_중에_방송이_끝나면_결제를_승인하지_않고_주문을_취소한다() {
+    let fixture = DonationFixture::new().await;
+    let order = fixture.order(5_000, "").await;
+    let payment_key = fixture
+        .toss
+        .authorize(&order.order_id, 5_000, OnConfirm::Approve);
+    fixture.end_broadcast().await;
+
+    let reply = fixture.confirm(&payment_key, &order.order_id, 5_000).await;
+
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert_eq!(
+        reply.message(),
+        "방송이 끝나 결제를 승인하지 않았습니다. 돈은 나가지 않습니다."
+    );
+    assert_eq!(fixture.toss.confirm_calls(), 0);
+    assert_eq!(fixture.status(&order.order_id).await, "canceled");
+    assert_eq!(fixture.confirmed_total().await, (0, 0));
 }

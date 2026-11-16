@@ -6,7 +6,7 @@
 use dioxus::prelude::*;
 use shared::{
     Broadcast, BroadcastStatus, ConfirmDonation, DONATION_MAX_AMOUNT, DONATION_MESSAGE_MAX_CHARS,
-    DONATION_MIN_AMOUNT, DONATION_PRESET_AMOUNTS, Donation, DonationOrder,
+    DONATION_MIN_AMOUNT, DONATION_PRESET_AMOUNTS, Donation, DonationFailure, DonationOrder,
 };
 use uuid::Uuid;
 
@@ -109,8 +109,23 @@ fn DonationForm(broadcast_id: Uuid, recipient: String) -> Element {
         // 결제를 마치면 성공·실패 주소로 페이지가 바뀐다. 바뀌지 않고 돌아왔다면(결제창 닫기 등) 실패다.
         if let Err(failure) = request_payment(&current).await {
             error.set(Some(failure_text(&failure.code, &failure.message)));
+            report_failure(&current.order_id, &failure).await;
+            // 끝난 주문으로는 다시 결제할 수 없으므로 금액 고르기부터 다시 한다.
+            order.set(None);
         }
         busy.set(false);
+    };
+
+    let choose_again = move |_| async move {
+        if let Some(current) = order() {
+            let canceled = PaymentFailure {
+                code: "USER_CANCEL".into(),
+                message: String::new(),
+            };
+            report_failure(&current.order_id, &canceled).await;
+        }
+        order.set(None);
+        error.set(None);
     };
 
     if let Some(current) = order() {
@@ -131,15 +146,7 @@ fn DonationForm(broadcast_id: Uuid, recipient: String) -> Element {
                     button { class: "live", disabled: busy(), onclick: pay,
                         if busy() { "결제창을 여는 중…" } else { "{format_won(current.amount)} 결제하기" }
                     }
-                    button {
-                        class: "secondary",
-                        disabled: busy(),
-                        onclick: move |_| {
-                            order.set(None);
-                            error.set(None);
-                        },
-                        "금액 다시 고르기"
-                    }
+                    button { class: "secondary", disabled: busy(), onclick: choose_again, "금액 다시 고르기" }
                 }
             }
         };
@@ -212,6 +219,18 @@ pub fn failure_text(code: &str, message: &str) -> String {
             format!("결제에 실패했습니다({code}). 후원은 이루어지지 않았습니다.")
         }
         _ => format!("결제에 실패했습니다: {message} 후원은 이루어지지 않았습니다."),
+    }
+}
+
+/// 결제 실패·취소를 서버에 알려 결제 대기 주문을 끝낸다. 알리지 못해도 주문은 승인되지 않으므로 화면 안내는 그대로 둔다.
+async fn report_failure(order_id: &str, failure: &PaymentFailure) {
+    let failure = DonationFailure {
+        order_id: order_id.to_owned(),
+        code: failure.code.clone(),
+        message: failure.message.clone(),
+    };
+    if let Err(text) = api::fail_donation(&failure).await {
+        dioxus::logger::tracing::warn!("결제 실패를 알리지 못했습니다: {text}");
     }
 }
 
@@ -333,6 +352,40 @@ pub fn DonationSuccess(query: String) -> Element {
                 BackToBroadcast { broadcast_id: back }
             },
         }
+    }
+}
+
+/// 결제창의 실패 주소. 결제 실패·취소를 서버에 알리고 이유를 보여 준다.
+/// 사용자가 취소하면 토스페이먼츠가 주문번호를 주지 않으므로 결제창을 열기 전에 기억해 둔 주문을 쓴다.
+#[component]
+pub fn DonationFail(query: String) -> Element {
+    let params = parse_query(&query);
+    let code = params
+        .get("code")
+        .cloned()
+        .unwrap_or_else(|| "UNKNOWN".into());
+    let message = params.get("message").cloned().unwrap_or_default();
+    let remembered = remembered_order();
+    let order_id = params
+        .get("orderId")
+        .cloned()
+        .or_else(|| remembered.as_ref().map(|order| order.order_id.clone()));
+    let back = remembered.map(|order| order.broadcast_id);
+    let text = failure_text(&code, &message);
+
+    use_future(move || {
+        let (order_id, code, message) = (order_id.clone(), code.clone(), message.clone());
+        async move {
+            if let Some(order_id) = order_id {
+                report_failure(&order_id, &PaymentFailure { code, message }).await;
+            }
+        }
+    });
+
+    rsx! {
+        h1 { "후원 결제" }
+        p { class: "notice error", role: "alert", "{text}" }
+        BackToBroadcast { broadcast_id: back }
     }
 }
 

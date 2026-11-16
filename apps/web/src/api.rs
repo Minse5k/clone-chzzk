@@ -4,10 +4,10 @@ use gloo_net::http::{Request, RequestBuilder, Response};
 use serde::{Deserialize, de::DeserializeOwned};
 use shared::{
     AuthResponse, Broadcast, Comment, ConfirmDonation, Credentials, DONATION_CONFIRM_PATH,
-    Donation, DonationOrder, LOGIN_PATH, LOGOUT_PATH, ME_PATH, NewComment, NewDonation,
-    SIGNUP_PATH, UPLOAD_POLICY_PATH, UpdateBroadcast, UploadPolicy, User, broadcast_end_path,
-    broadcast_path, comment_path, comments_path, donations_path, live_playlist_path,
-    recording_path, registration_fields,
+    DONATION_FAIL_PATH, Donation, DonationFailure, DonationOrder, LOGIN_PATH, LOGOUT_PATH, ME_PATH,
+    NewComment, NewDonation, SIGNUP_PATH, UPLOAD_POLICY_PATH, UpdateBroadcast, UploadPolicy, User,
+    broadcast_end_path, broadcast_path, comment_path, comments_path, donations_path,
+    live_playlist_path, recording_path, registration_fields,
 };
 use uuid::Uuid;
 use web_sys::{File, FormData};
@@ -233,6 +233,22 @@ pub async fn confirm_donation(request: &ConfirmDonation) -> ApiResult<Donation> 
         .json(request)
         .map_err(|_| "요청을 준비할 수 없습니다.".to_owned())?;
     read_json(request.send().await).await
+}
+
+/// 결제 실패·취소를 서버에 알려 결제 대기 주문을 끝낸다.
+pub async fn fail_donation(failure: &DonationFailure) -> ApiResult<()> {
+    let request = authorized(Request::post(&url(DONATION_FAIL_PATH)))
+        .json(failure)
+        .map_err(|_| "요청을 준비할 수 없습니다.".to_owned())?;
+    let response = request
+        .send()
+        .await
+        .map_err(|_| "서버에 연결할 수 없습니다.".to_owned())?;
+    if response.ok() {
+        Ok(())
+    } else {
+        Err(error_message(response).await)
+    }
 }
 
 #[derive(Deserialize)]

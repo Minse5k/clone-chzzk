@@ -332,3 +332,16 @@ pub fn donations_path(broadcast_id: Uuid) -> String {
 
 /// 결제 승인 확인 API 경로(로그인 필요, 주문한 사용자만).
 pub const DONATION_CONFIRM_PATH: &str = "/api/donations/confirm";
+
+/// 결제 실패·취소 통지. 결제창의 실패 주소가 돌려준 코드와 메시지를 담는다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DonationFailure {
+    pub order_id: String,
+    /// 토스페이먼츠 오류 코드. 사용자가 취소하면 `PAY_PROCESS_CANCELED`(또는 SDK의 `USER_CANCEL`).
+    pub code: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// 결제 실패·취소 통지 API 경로(로그인 필요, 주문한 사용자만).
+pub const DONATION_FAIL_PATH: &str = "/api/donations/fail";
