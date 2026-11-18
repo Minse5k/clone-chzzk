@@ -6,9 +6,11 @@ use anyhow::Context;
 #[derive(Debug, Clone)]
 pub struct Config {
     /// PostgreSQL 연결 주소. 모든 서버 인스턴스가 같은 DB를 쓴다.
-    pub database_url: DatabaseUrl,
+    pub database_url: ConnectionUrl,
     /// 인스턴스 하나가 여는 DB 연결 수의 상한.
     pub database_max_connections: u32,
+    /// 인스턴스 사이에 알림을 전하는 Redis 주소. 없으면 인스턴스 하나로 보고 프로세스 안에서만 전한다.
+    pub redis_url: Option<ConnectionUrl>,
     /// 녹화본 저장소.
     pub storage: StorageConfig,
     /// 브라우저 호출을 허용할 웹 출처. `*`이면 모두 허용한다.
@@ -94,17 +96,17 @@ impl From<&str> for JwtSecret {
     }
 }
 
-/// DB 연결 주소. 비밀번호가 들어 있으므로 로그나 디버그 출력에 드러나지 않게 감싼다.
+/// DB·Redis 연결 주소. 비밀번호가 들어 있을 수 있으므로 로그나 디버그 출력에 드러나지 않게 감싼다.
 #[derive(Clone)]
-pub struct DatabaseUrl(pub String);
+pub struct ConnectionUrl(pub String);
 
-impl std::fmt::Debug for DatabaseUrl {
+impl std::fmt::Debug for ConnectionUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("DatabaseUrl(<숨김>)")
+        f.write_str("ConnectionUrl(<숨김>)")
     }
 }
 
-impl From<&str> for DatabaseUrl {
+impl From<&str> for ConnectionUrl {
     fn from(url: &str) -> Self {
         Self(url.to_owned())
     }
@@ -189,11 +191,16 @@ impl Config {
                 .ok()
                 .map(|url| url.trim().to_owned())
                 .filter(|url| !url.is_empty())
-                .map(DatabaseUrl)
+                .map(ConnectionUrl)
                 .context(
                     "DATABASE_URL이 필요합니다 (예: postgres://chzzk:<비밀번호>@localhost:5432/chzzk)",
                 )?,
             database_max_connections: env_number("DATABASE_MAX_CONNECTIONS", 10)?,
+            redis_url: env::var("REDIS_URL")
+                .ok()
+                .map(|url| url.trim().to_owned())
+                .filter(|url| !url.is_empty())
+                .map(ConnectionUrl),
             storage: StorageConfig::from_env()?,
             cors_allowed_origins: env_or("CORS_ALLOWED_ORIGINS", "http://localhost:8080")
                 .split(',')

@@ -148,6 +148,7 @@ impl TestServer {
         server::Config {
             database_url: db.url.as_str().into(),
             database_max_connections: 5,
+            redis_url: None,
             storage: server::StorageConfig::Local {
                 dir: dir.path().join("recordings"),
             },

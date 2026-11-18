@@ -373,6 +373,7 @@ cargo run -p server
 | `SERVER_ADDR` | `0.0.0.0:3000` | 서버 바인딩 주소 |
 | `DATABASE_URL` | — (필수) | PostgreSQL 연결 주소. 예: `postgres://postgres:postgres@localhost:5432/postgres` |
 | `DATABASE_MAX_CONNECTIONS` | `10` | 인스턴스 하나가 여는 DB 연결 수의 상한 |
+| `REDIS_URL` | — | 인스턴스 사이에 댓글·후원 알림과 송출 종료 신호를 전하는 Redis. 없으면 인스턴스 1개로 보고 프로세스 안에서만 전한다 |
 | `STORAGE_BACKEND` | `local` | 녹화본 저장소. `local` 또는 `oci` |
 | `STORAGE_DIR` | `data/recordings` | local 저장소 디렉터리 |
 | `OCI_S3_ENDPOINT` | — | (oci) S3 호환 엔드포인트 `https://<namespace>.compat.objectstorage.<region>.oraclecloud.com` |

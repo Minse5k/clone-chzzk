@@ -3,7 +3,7 @@
 // 테스트 파일마다 쓰는 도우미가 달라, 한 파일에서 쓰지 않는 함수가 있어도 경고하지 않는다.
 #![allow(dead_code)]
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
@@ -18,6 +18,11 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 pub const TEST_JWT_SECRET: &str = "test-only-jwt-secret";
+
+/// 여러 인스턴스 테스트가 쓰는 Redis 주소.
+pub fn test_redis_url() -> String {
+    std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into())
+}
 
 /// 테스트용 PostgreSQL 서버 주소. 이 서버에 테스트마다 새 데이터베이스를 만든다.
 fn test_database_server_url() -> String {
@@ -93,6 +98,7 @@ pub fn test_config(dir: &TempDir, db: &TestDatabase) -> server::Config {
     server::Config {
         database_url: db.url.as_str().into(),
         database_max_connections: 5,
+        redis_url: None,
         storage: server::StorageConfig::Local {
             dir: dir.path().join("recordings"),
         },
@@ -113,8 +119,9 @@ pub fn test_config(dir: &TempDir, db: &TestDatabase) -> server::Config {
 /// 실제 포트에서도 요청을 받는 테스트 서버. HTTP 요청은 라우터에 바로 보내고,
 /// WebSocket은 `addr`로 연결한다.
 pub struct TestApp {
-    pub dir: TempDir,
-    pub db: TestDatabase,
+    /// 녹화본·라이브 조각 디렉터리. 여러 인스턴스 테스트에서는 공유 볼륨처럼 인스턴스끼리 함께 쓴다.
+    pub dir: Arc<TempDir>,
+    pub db: Arc<TestDatabase>,
     pub app: Router,
     pub addr: SocketAddr,
 }
@@ -141,10 +148,33 @@ impl TestApp {
     }
 
     pub async fn with_config(edit: impl FnOnce(&mut server::Config)) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let db = TestDatabase::create().await;
+        let dir = Arc::new(tempfile::tempdir().unwrap());
+        let db = Arc::new(TestDatabase::create().await);
         let mut config = test_config(&dir, &db);
         edit(&mut config);
+        Self::serve(dir, db, config).await
+    }
+
+    /// 같은 DB·Redis·공유 디렉터리를 쓰는 서버 인스턴스 두 개(A, B)를 띄운다.
+    pub async fn cluster(edit: impl Fn(&mut server::Config)) -> (Self, Self) {
+        let first = Self::with_config(|config| {
+            config.redis_url = Some(test_redis_url().as_str().into());
+            edit(config);
+        })
+        .await;
+        let second = first.peer(edit).await;
+        (first, second)
+    }
+
+    /// 이 서버와 같은 DB·Redis·공유 디렉터리를 쓰는 인스턴스를 하나 더 띄운다.
+    pub async fn peer(&self, edit: impl Fn(&mut server::Config)) -> Self {
+        let mut config = test_config(&self.dir, &self.db);
+        config.redis_url = Some(test_redis_url().as_str().into());
+        edit(&mut config);
+        Self::serve(Arc::clone(&self.dir), Arc::clone(&self.db), config).await
+    }
+
+    async fn serve(dir: Arc<TempDir>, db: Arc<TestDatabase>, config: server::Config) -> Self {
         let app = server::build_app(config).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

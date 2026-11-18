@@ -2,6 +2,7 @@
 
 mod api;
 mod auth;
+mod bus;
 mod comments;
 mod config;
 mod db;
@@ -23,7 +24,7 @@ use tower_http::{
 };
 
 pub use config::{
-    Config, DatabaseUrl, JwtSecret, OciStorageConfig, StorageConfig, TossConfig,
+    Config, ConnectionUrl, JwtSecret, OciStorageConfig, StorageConfig, TossConfig,
     server_addr_from_env,
 };
 
@@ -35,6 +36,8 @@ pub struct AppState {
     pub live: Arc<live::LiveCapacity>,
     pub auth: Arc<auth::AuthKeys>,
     pub comments: Arc<comments::CommentHub>,
+    /// 인스턴스 사이의 알림 전달(Redis Pub/Sub).
+    pub bus: Arc<bus::Bus>,
     /// 후원 결제. 토스페이먼츠 키를 설정하지 않았으면 `None`이고 후원만 막는다.
     pub payments: Option<Arc<payments::TossPayments>>,
 }
@@ -49,7 +52,14 @@ pub async fn build_app(config: Config) -> anyhow::Result<Router> {
         Some(dir) => Some(web_service(dir)?),
         None => None,
     };
-    let live = live::LiveCapacity::check(&config).await;
+    let live = Arc::new(live::LiveCapacity::check(&config).await);
+    let comments = Arc::new(comments::CommentHub::default());
+    let bus = bus::Bus::start(
+        config.redis_url.as_ref().map(|url| url.0.as_str()),
+        Arc::clone(&comments),
+        Arc::clone(&live),
+    )
+    .await?;
     let auth = auth::AuthKeys::new(&config);
     let payments = match &config.toss {
         Some(toss) => Some(Arc::new(payments::TossPayments::new(toss)?)),
@@ -64,9 +74,10 @@ pub async fn build_app(config: Config) -> anyhow::Result<Router> {
         db,
         store: Arc::new(store),
         config: Arc::new(config),
-        live: Arc::new(live),
+        live,
         auth: Arc::new(auth),
-        comments: Arc::default(),
+        comments,
+        bus: Arc::new(bus),
         payments,
     };
     // 서버가 송출 도중에 멈췄다면 라이브 중으로 남은 방송을 정리한다.

@@ -1,4 +1,4 @@
-# 배포용 구성: PostgreSQL, 앱(서버 + 웹) 컨테이너와 그 앞의 Caddy 리버스 프록시.
+# 배포용 구성: PostgreSQL, Redis, 앱(서버 + 웹) 컨테이너와 그 앞의 Caddy 리버스 프록시.
 # 비밀 값은 저장소에 없는 .env 파일로만 넣는다(.env.example 참고).
 services:
   postgres:
@@ -16,11 +16,22 @@ services:
       timeout: 3s
       retries: 30
 
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
   app:
     build: .
     restart: unless-stopped
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     env_file:
       - path: .env
@@ -30,6 +41,7 @@ services:
       SERVER_ADDR: 0.0.0.0:3000
       WEB_DIST_DIR: /app/web
       DATABASE_URL: postgres://chzzk:${POSTGRES_PASSWORD}@postgres:5432/chzzk
+      REDIS_URL: redis://redis:6379
       STORAGE_DIR: /data/recordings
       LIVE_DIR: /data/live
       FFMPEG_PATH: ffmpeg
