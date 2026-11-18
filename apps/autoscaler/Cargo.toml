@@ -1,0 +1,9 @@
+[package]
+name = "autoscaler"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+# 직접 만든 오토스케일러. docker CLI로 app 인스턴스의 CPU 사용률을 재고, 인스턴스 수를 바꾼다.
+[dependencies]
+serde_json.workspace = true
