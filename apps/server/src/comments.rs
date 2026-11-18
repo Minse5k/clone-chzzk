@@ -61,12 +61,15 @@ async fn create_comment(
     if !db::insert_comment(&state.db, &comment).await? {
         return Err(broadcast_not_found());
     }
-    state.comments.publish(
-        broadcast_id,
-        CommentEvent::Created {
-            comment: comment.clone(),
-        },
-    );
+    state
+        .bus
+        .publish(
+            broadcast_id,
+            CommentEvent::Created {
+                comment: comment.clone(),
+            },
+        )
+        .await;
     Ok((StatusCode::CREATED, Json(comment)))
 }
 
@@ -91,12 +94,15 @@ async fn delete_comment(
         ));
     }
     db::delete_comment(&state.db, comment.id).await?;
-    state.comments.publish(
-        broadcast_id,
-        CommentEvent::Deleted {
-            comment_id: comment.id,
-        },
-    );
+    state
+        .bus
+        .publish(
+            broadcast_id,
+            CommentEvent::Deleted {
+                comment_id: comment.id,
+            },
+        )
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -130,7 +136,8 @@ fn validate_body(body: &str) -> Result<String, ApiError> {
     Ok(body.to_owned())
 }
 
-/// 방송별 댓글 알림 채널. 댓글 WebSocket 연결마다 구독하고, 댓글 API가 처리를 마친 뒤 알린다.
+/// 이 인스턴스의 방송별 댓글 알림 채널. 댓글 WebSocket 연결마다 구독하고,
+/// `Bus`가 (다른 인스턴스에서 생긴 것까지) 알림을 받아 여기에 나눈다.
 #[derive(Default)]
 pub struct CommentHub {
     channels: Mutex<HashMap<Uuid, broadcast::Sender<CommentEvent>>>,
@@ -147,8 +154,9 @@ impl CommentHub {
             .subscribe()
     }
 
-    /// 구독자에게 알린다. 구독자가 없으면 채널을 정리한다.
-    pub(crate) fn publish(&self, broadcast_id: Uuid, event: CommentEvent) {
+    /// 이 인스턴스의 구독자에게 알린다. 구독자가 없으면 채널을 정리한다.
+    /// 다른 인스턴스까지 알리려면 `Bus::publish`를 쓴다.
+    pub(crate) fn deliver(&self, broadcast_id: Uuid, event: CommentEvent) {
         let mut channels = self.lock();
         if let Some(sender) = channels.get(&broadcast_id)
             && sender.send(event).is_err()
@@ -168,9 +176,15 @@ impl CommentHub {
         }
     }
 
-    /// 방송이 지워졌다. 채널을 없애 그 방송의 댓글 WebSocket 연결이 모두 닫히게 한다.
-    pub fn close(&self, broadcast_id: Uuid) {
+    /// 방송이 지워졌다. 채널을 없애 이 인스턴스에 붙은 그 방송의 댓글 WebSocket 연결이 모두 닫히게 한다.
+    pub(crate) fn close(&self, broadcast_id: Uuid) {
         self.lock().remove(&broadcast_id);
+    }
+
+    /// 이 인스턴스의 댓글 WebSocket 연결을 모두 닫는다. 인스턴스가 내려갈 때 쓴다.
+    /// 시청 화면은 잠시 뒤 다시 연결하며 다른 인스턴스로 붙는다.
+    pub(crate) fn close_all(&self) {
+        self.lock().clear();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, broadcast::Sender<CommentEvent>>> {

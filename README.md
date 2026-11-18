@@ -3,9 +3,40 @@
 방송을 송출·등록하고 시청하며 댓글과 후원을 나누는 서비스. 최종 목표는 데스크톱에서 송출한 라이브 방송을 웹에서 시청하는 것이며, 과제 단위로 하나씩 확장한다.
 
 - 도메인 용어: [GLOSSARY.md](GLOSSARY.md)
-- 설계 결정: [docs/adr/](docs/adr/) (라이브 송출 방식은 [ADR 0003](docs/adr/0003-live-ingest-websocket-to-hls.md), 로그인 방식은 [ADR 0004](docs/adr/0004-jwt-auth-with-revocation-list.md), 후원 결제 확정 방식은 [ADR 0005](docs/adr/0005-donation-confirmed-by-server-payment-approval.md))
+- 설계 결정: [docs/adr/](docs/adr/) (라이브 송출 방식은 [ADR 0003](docs/adr/0003-live-ingest-websocket-to-hls.md), 로그인 방식은 [ADR 0004](docs/adr/0004-jwt-auth-with-revocation-list.md), 후원 결제 확정 방식은 [ADR 0005](docs/adr/0005-donation-confirmed-by-server-payment-approval.md), 여러 인스턴스의 공용 상태와 오토스케일 방식은 [ADR 0006](docs/adr/0006-multi-instance-shared-state.md))
 
-## 이번 단계(과제 4) 구현 범위
+## 이번 단계(과제 5) 구현 범위
+
+과제 4까지의 서비스를 **로컬에서 여러 인스턴스로 띄우고, CPU 사용률에 따라 인스턴스 수가 자동으로 늘고 줄게** 했다. 클라우드 배포 없이 Docker Compose 하나로 확인한다. 인스턴스가 늘거나 줄어도 로그인·영상·라이브·댓글·후원이 유지되도록 상태를 모두 인스턴스 밖 공용 저장소로 옮겼다.
+
+| 요구 사항 | 구현 |
+|---|---|
+| 서버 컨테이너 이미지 | [`Dockerfile`](Dockerfile)(서버 + 빌드된 웹 + ffmpeg). 오토스케일러는 [`apps/autoscaler/Dockerfile`](apps/autoscaler/Dockerfile). |
+| 여러 인스턴스 실행 | [`compose.yaml`](compose.yaml)의 `app` 서비스. `container_name`·호스트 포트가 없어 `--scale`로 여러 개를 띄운다. 인스턴스마다 코어 1개(`cpus: 1`)까지 쓴다. |
+| 지표 기준 자동 조절 | 직접 만든 오토스케일러 [`apps/autoscaler`](apps/autoscaler/src/main.rs)가 10초마다 `docker stats`로 app 인스턴스들의 CPU 사용률을 재고 **HPA와 같은 식**(`ceil(현재 수 × 평균 CPU ÷ 목표)`, 허용 오차 10%)으로 원하는 수를 정해 `AUTOSCALER_MIN`(1)~`AUTOSCALER_MAX`(5) 안에서 맞춘다. 늘리기는 바로(`docker compose up --scale`), 줄이기는 60초 안정화 뒤 **라이브 송출을 받지 않는 인스턴스만** 골라 `docker stop`(정상 종료)한다. 판단 규칙은 [`policy.rs`](apps/autoscaler/src/policy.rs)(단위 테스트 10개). |
+| 요청 분산 | [`deploy/Caddyfile`](deploy/Caddyfile): Caddy가 Docker DNS의 `app` A 레코드를 1초마다 다시 읽어(`dynamic a`) 떠 있는 인스턴스 모두에 `least_conn`으로 나눈다. 막 내려간 인스턴스로 연결이 실패하면 다른 인스턴스로 다시 보낸다(`lb_try_duration`). |
+| 공용 상태 | **PostgreSQL**: 사용자·로그아웃 목록·방송·녹화본 정보·댓글·후원(SQLite에서 옮김). **Redis Pub/Sub**: 댓글·후원 실시간 알림, 방송 삭제·라이브 종료 신호를 모든 인스턴스에 전달([`bus.rs`](apps/server/src/bus.rs)). **공유 볼륨 `app-data`**: 녹화본과 라이브 HLS 조각(OCI Object Storage도 그대로 쓸 수 있음). **JWT**: 모든 인스턴스가 같은 `JWT_SECRET`을 쓴다. |
+| 라이브 상태 유지 | 송출받는 인스턴스가 방송에 **하트비트**를 5초마다 남기고, 하트비트가 30초 넘게 끊긴 라이브만 다른 인스턴스가 종료·녹화본으로 정리한다(전에는 서버가 시작할 때 라이브를 모두 끝내 새 인스턴스가 뜨면 다른 인스턴스의 방송이 끝났다). 동시 라이브 수는 DB에서 서비스 전체로 센다. 인스턴스는 `/healthz`로 송출 수를 알리고, SIGTERM을 받으면 송출을 마무리해 녹화본까지 만든 뒤 내려간다. |
+| 부하 발생 | [`deploy/load/k6.js`](deploy/load/k6.js)(k6). 방송 목록·상세·댓글 조회와 로그인(argon2 해시로 CPU를 씀)을 섞는다. `docker compose --profile load run --rm k6` |
+
+```mermaid
+flowchart LR
+    U[브라우저 / k6] --> C[Caddy<br/>dynamic a + least_conn]
+    C --> A1[app-1]
+    C --> A2[app-2]
+    C --> A3[app-N]
+    A1 & A2 & A3 --> P[(PostgreSQL)]
+    A1 & A2 & A3 <--> R[(Redis Pub/Sub)]
+    A1 & A2 & A3 --> V[(공유 볼륨<br/>녹화본·HLS)]
+    S[autoscaler] -- docker stats / healthz --> A1 & A2 & A3
+    S -- compose up --scale / docker stop --> D[Docker]
+```
+
+**과제 1~4 기능(유지)**: 녹화방송, 휴대폰 라이브 송출·시청, 회원가입·로그인·로그아웃, 소유자 권한, 댓글과 실시간 반영, 토스페이먼츠 테스트 결제 후원. 기능은 그대로이고 저장 위치만 바뀌었다(SQLite → PostgreSQL). 과제 4 이전의 SQLite 데이터는 옮기지 않으므로 새 DB로 시작한다.
+
+**이번 단계에서 하지 않는 것**: 클라우드 배포·OCI 재배포, Kubernetes, 요청 수 기반 스케일링, Postgres·Redis 자체의 다중화, 송출 연결을 다른 인스턴스로 옮기기(송출받던 인스턴스가 죽으면 그 방송은 종료로 정리된다), SQLite→Postgres 데이터 이전 도구.
+
+## 과제 4 구현 범위(유지)
 
 과제 3까지의 녹화방송·휴대폰 라이브 송출·인증·인가·댓글에 **방송자를 후원하는 도네이션**을 더했다. 결제는 **토스페이먼츠 테스트 모드**(결제위젯)로만 하며 실제 돈은 오가지 않는다. 화면의 성공 표시가 아니라 **서버가 결제 승인 API로 확인한 결과로만 후원을 확정**하고, 같은 승인 통지가 여러 번 와도 **한 번만 적립**한다.
 
@@ -38,7 +69,7 @@ sequenceDiagram
     T-)S: 웹훅(결제 상태 변경) — 결제 조회 API로 다시 확인, 이미 확정이면 무시
 ```
 
-후원 확정 코드는 `apps/server/src/donations.rs`의 `confirm`·`finalize`·`verify`·`webhook`, 중복 방지 저장 구조는 `apps/server/migrations/0007_create_donations.sql`과 `apps/server/src/db.rs`의 `confirm_donation`에 있다.
+후원 확정 코드는 `apps/server/src/donations.rs`의 `confirm`·`finalize`·`verify`·`webhook`, 중복 방지 저장 구조는 `apps/server/migrations/0001_initial_schema.sql`의 `donations`와 `apps/server/src/db.rs`의 `confirm_donation`에 있다.
 
 **과제 1~3 기능(유지)**: 녹화방송 등록·목록·상세·재생, 휴대폰 라이브 송출·시청·방송 상태·종료 후 녹화본, 회원가입·로그인·로그아웃(JWT), 소유자 권한(제목 수정·삭제·라이브 종료), 댓글과 실시간 반영. 달라진 점은 **확정된 후원이 있는 방송은 후원 내역을 지키기 위해 삭제할 수 없다**(409)는 것뿐이다.
 
@@ -73,32 +104,43 @@ Cargo workspace 모노레포.
 
 | 경로 | 설명 |
 |---|---|
-| `apps/server` | axum API 서버. SQLite(sqlx)에 사용자·방송·댓글을 저장한다. `src/auth.rs`가 회원가입·로그인·로그아웃과 토큰 검증(`AuthUser`), `src/api.rs`가 방송 API와 소유자 권한 확인(`find_owned`), `src/comments.rs`가 댓글 API와 방송 알림 WebSocket, `src/donations.rs`가 후원 주문·승인 확인·실패 통지·웹훅·내역, `src/payments.rs`가 토스페이먼츠 결제 승인·조회 API, `src/live.rs`가 송출 WebSocket·ffmpeg HLS 변환·라이브 재생·종료 후 녹화본을 맡는다. |
+| `apps/server` | axum API 서버. PostgreSQL(sqlx)에 사용자·방송·댓글·후원을 저장한다. `src/auth.rs`가 회원가입·로그인·로그아웃과 토큰 검증(`AuthUser`), `src/api.rs`가 방송 API와 소유자 권한 확인(`find_owned`), `src/comments.rs`가 댓글 API와 방송 알림 WebSocket, `src/donations.rs`가 후원 주문·승인 확인·실패 통지·웹훅·내역, `src/payments.rs`가 토스페이먼츠 결제 승인·조회 API, `src/live.rs`가 송출 WebSocket·ffmpeg HLS 변환·라이브 재생·종료 후 녹화본·하트비트, `src/bus.rs`가 Redis Pub/Sub로 인스턴스 사이의 알림 전달을 맡는다. |
 | `apps/web` | Dioxus 0.7 웹 앱. 방송 목록·상세(녹화본/라이브 플레이어, 소유자 관리, 댓글)·등록·라이브 송출·로그인·회원가입 화면. `src/session.rs`가 로그인 상태, `src/comments.rs`가 댓글 영역과 실시간 연결, `src/donations.rs`가 후원 폼·토스페이먼츠 결제위젯·결제 결과 화면·후원 내역, `src/live.rs`가 카메라·마이크와 송출을 맡는다. |
+| `apps/autoscaler` | 직접 만든 오토스케일러(과제 5). docker CLI로 app 인스턴스의 CPU 사용률을 재고 `src/policy.rs`의 규칙으로 인스턴스 수를 바꾼다. |
 | `crates/shared` | 서버와 웹이 함께 쓰는 API 타입, 송출·댓글 WebSocket 메시지. |
+| `compose.yaml`, `deploy/` | 로컬 오토스케일 구성(PostgreSQL, Redis, app × N, Caddy, 오토스케일러, k6 부하). `deploy/Caddyfile`이 분산, `deploy/load/k6.js`가 부하 스크립트. |
 
 ## 준비물
 
 - Rust (stable) 와 `wasm32-unknown-unknown` 타깃: `rustup target add wasm32-unknown-unknown`
 - Dioxus CLI 0.7: `cargo install dioxus-cli --version ^0.7 --locked`
+- Docker (PostgreSQL·Redis와 과제 5의 오토스케일 구성용)
 - ffmpeg (라이브 송출용): macOS `brew install ffmpeg`, Ubuntu `sudo apt-get install ffmpeg`
   - 없어도 서버는 시작하며 녹화방송 기능은 그대로 동작한다. 송출만 거부된다.
 
 ## 로컬 실행
 
-터미널 두 개를 쓴다. 기본값만으로 실행되며 비밀 값은 필요 없다.
+PostgreSQL 하나와 터미널 두 개를 쓴다. 아래 개발용 DB 비밀번호(`postgres`)는 로컬에서만 쓰는 값이다.
+
+```bash
+# 개발·테스트용 PostgreSQL (한 번만)
+docker run -d --name chzzk-dev-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17
+```
 
 ```bash
 # 터미널 1: API 서버 (http://localhost:3000)
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
 cargo run -p server
 ```
+
+아래의 `cargo run -p server` 예시는 모두 터미널 1에서 이렇게 `DATABASE_URL`을 내보낸 상태를 가정한다.
 
 ```bash
 # 터미널 2: 웹 (http://localhost:8080)
 dx serve -p web
 ```
 
-브라우저에서 http://localhost:8080 을 연다. 데이터는 기본적으로 `data/` 아래(SQLite 파일, 녹화본, 라이브 HLS 조각)에 저장된다. 이 상태에서 같은 PC의 브라우저는 웹캠으로 송출할 수 있다(localhost는 브라우저가 보안 출처로 취급한다).
+브라우저에서 http://localhost:8080 을 연다. DB는 PostgreSQL에, 녹화본과 라이브 HLS 조각은 기본적으로 `data/` 아래에 저장된다. 이 상태에서 같은 PC의 브라우저는 웹캠으로 송출할 수 있다(localhost는 브라우저가 보안 출처로 취급한다).
 
 `JWT_SECRET`을 정하지 않으면 서버가 시작할 때마다 임시 서명 키를 만든다(로그에 경고가 나온다). 이 경우 서버를 다시 켜면 모든 사용자가 로그아웃되므로 다시 로그인하면 된다. 로그인을 유지하려면 직접 만든 값을 지정한다.
 
@@ -126,6 +168,38 @@ dx serve -p web --port 8090
 ```bash
 TOSS_CLIENT_KEY=<테스트 클라이언트 키> TOSS_SECRET_KEY=<테스트 시크릿 키> JWT_SECRET="$(openssl rand -base64 48)" cargo run -p server
 ```
+
+## 로컬 오토스케일 실행 (과제 5)
+
+Docker만 있으면 된다. 이 구성이 서버를 여러 인스턴스로 띄우고 CPU 사용률에 따라 늘리고 줄인다.
+
+```bash
+cp .env.example .env
+# .env에서 아래 두 값을 채운다(필수, 커밋 금지). 나머지는 비워 두면 기본값이다.
+#   POSTGRES_PASSWORD=$(openssl rand -hex 24) 결과
+#   JWT_SECRET=$(openssl rand -base64 48) 결과
+docker compose up -d --build
+```
+
+- 첫 빌드는 웹(Dioxus)·서버를 컴파일하느라 10분 이상 걸린다.
+- 브라우저에서 http://localhost 를 연다. 80번 포트를 다른 프로그램이 쓰고 있으면 `.env`에 `HTTP_PORT=8088`을 두고 http://localhost:8088 을 연다.
+- 처음에는 `app` 인스턴스가 `AUTOSCALER_MIN`(기본 1)개 뜬다.
+
+인스턴스 수와 스케일러의 판단은 다음으로 본다.
+
+```bash
+docker compose ps app
+docker compose logs -f autoscaler
+```
+
+부하를 걸면(기본 40 가상 사용자, 3분) 인스턴스가 늘고, 부하가 끝나고 안정화 시간(기본 60초)이 지나면 줄어든다.
+
+```bash
+docker compose --profile load run --rm k6
+# 세기·시간 조절: LOAD_VUS=80 LOAD_DURATION=5m docker compose --profile load run --rm k6
+```
+
+정리: `docker compose down`(데이터 유지) 또는 `docker compose down -v`(DB·녹화본 볼륨까지 삭제).
 
 ## 휴대폰 연결 (HTTPS 주소)
 
@@ -174,6 +248,52 @@ cloudflared tunnel --url http://localhost:3000
 다른 앱(화상회의 등)이 카메라를 쓰고 있으면 "다른 앱이 카메라나 마이크를 쓰고 있습니다" 안내가 나온다. 그 앱을 닫고 다시 시도한다. 송출 중에 다른 앱으로 넘어가거나 화면을 끄면 휴대폰 브라우저가 카메라를 멈춘다. 20초 안에 돌아오지 않으면 방송이 종료된다.
 
 ## 직접 확인 절차
+
+### 과제 5: 스케일 아웃·인과 상태 유지
+
+1. [로컬 오토스케일 실행](#로컬-오토스케일-실행-과제-5)대로 띄운다. `docker compose ps app`에 `chzzk-app-1` 하나만 보인다.
+2. 브라우저(http://localhost)에서 가입·로그인하고, 녹화방송을 하나 등록하고 댓글을 하나 쓴다.
+3. 다른 터미널에서 `docker compose logs -f autoscaler`를 열어 두고 부하를 건다: `docker compose --profile load run --rm k6`.
+4. **스케일 아웃**: 10~20초 안에 로그에 `스케일 아웃: 1 → 2`, `2 → 5`가 나오고, `docker compose ps app`에 인스턴스가 늘어 있다.
+5. **스케일 중 상태 유지**: 그동안 브라우저를 새로고침한다. 로그인이 풀리지 않고 방송 목록·댓글이 그대로다. 요청이 여러 인스턴스로 나뉘어도 같은 DB·Redis·공유 볼륨을 보기 때문이다. 두 브라우저에서 같은 방송을 열고 댓글을 쓰면 다른 인스턴스에 붙은 쪽에도 바로 나타난다.
+6. **스케일 인**: k6가 끝나고 60초(안정화 시간)쯤 지나면 `스케일 인: chzzk-app-5 정상 종료 …`가 이어지고 1개로 돌아온다. 로그인·목록·댓글은 그대로다.
+7. (선택) 라이브 송출 중에는 그 방송을 받는 인스턴스를 줄이지 않는다. 휴대폰이나 같은 PC 브라우저로 송출을 켜 둔 채 3~6을 하면, 송출을 받는 인스턴스는 남고 나머지만 줄어든다(`줄일 수 있는 인스턴스가 N개뿐입니다` 로그). 다른 인스턴스로 연 시청 화면에서도 라이브가 재생된다.
+
+#### 확인한 기록 (2026-11-18, MacBook Docker Desktop 10코어, 기본 설정)
+
+k6 40 가상 사용자 3분. 5초마다 센 app 인스턴스 수와 30초마다 확인한 상태(로그인한 토큰으로 `/api/auth/me`, 방송 목록, 부하 전에 쓴 댓글):
+
+```text
+09:53:53 app=1            ← k6 시작
+09:54:03 app=2
+09:54:13 app=5
+로그인 상태 200 (scaletester), 방송 목록 200 (1개), 댓글 200 (['스케일 전에 쓴 댓글'])
+…  (09:54:13 ~ 09:57:59 app=5 유지, 30초마다 같은 확인 결과)
+09:58:04 app=1            ← k6 종료(약 09:56:55) 뒤 부하가 사라진 것을 본 지 60초(안정화) 뒤
+로그인 상태 200 (scaletester), 방송 목록 200 (1개), 댓글 200 (['스케일 전에 쓴 댓글'])
+```
+
+오토스케일러 로그(`docker compose logs autoscaler`, 시각은 UTC):
+
+```text
+[autoscaler 00:53:46Z] 인스턴스 1개 CPU [6%] 평균 6.4% (목표 50%) → 원하는 수 1, 맞출 수 1
+[autoscaler 00:53:58Z] 인스턴스 1개 CPU [100%] 평균 99.8% (목표 50%) → 원하는 수 2, 맞출 수 2
+[autoscaler 00:53:58Z] 스케일 아웃: 1 → 2
+[autoscaler 00:54:11Z] 인스턴스 2개 CPU [103% 100%] 평균 101.2% (목표 50%) → 원하는 수 5, 맞출 수 5
+[autoscaler 00:54:11Z] 스케일 아웃: 2 → 5
+[autoscaler 00:54:24Z] 인스턴스 5개 CPU [102% 98% 100% 98% 100%] 평균 99.3% (목표 50%) → 원하는 수 5, 맞출 수 5
+…
+[autoscaler 00:57:12Z] 인스턴스 5개 CPU [0% 0% 0% 0% 0%] 평균 0.0% (목표 50%) → 원하는 수 1, 맞출 수 5
+…  (안정화 시간 동안 5 유지)
+[autoscaler 00:57:59Z] 인스턴스 5개 CPU [0% 0% 0% 0% 0%] 평균 0.0% (목표 50%) → 원하는 수 1, 맞출 수 1
+[autoscaler 00:58:00Z] 스케일 인: chzzk-app-5 정상 종료 (5개 → 4개)
+[autoscaler 00:58:00Z] 스케일 인: chzzk-app-4 정상 종료 (4개 → 3개)
+[autoscaler 00:58:00Z] 스케일 인: chzzk-app-3 정상 종료 (3개 → 2개)
+[autoscaler 00:58:00Z] 스케일 인: chzzk-app-2 정상 종료 (2개 → 1개)
+[autoscaler 00:58:11Z] 인스턴스 1개 CPU [0%] 평균 0.0% (목표 50%) → 원하는 수 1, 맞출 수 1
+```
+
+k6 결과: 요청 78,547건, `http_req_failed 0.00%`, 검사(목록·상세·댓글·로그인·내 정보 200) 78,546건 모두 통과. 스케일 아웃·인 중에도 실패한 요청이 없었다. 다시 90초 부하를 걸었을 때도 `1 → 3 → 5`로 늘었다가 `5 → 1`로 줄었고 요청 32,757건이 모두 성공했다.
 
 ### 과제 4: 도네이션 (테스트 결제 성공·실패·취소, 승인 통지 중복)
 
@@ -363,7 +483,9 @@ cargo run -p server
 | 이름 | 기본값 | 설명 |
 |---|---|---|
 | `SERVER_ADDR` | `0.0.0.0:3000` | 서버 바인딩 주소 |
-| `DATABASE_PATH` | `data/chzzk.db` | SQLite 파일 경로 |
+| `DATABASE_URL` | — (필수) | PostgreSQL 연결 주소. 예: `postgres://postgres:postgres@localhost:5432/postgres` |
+| `DATABASE_MAX_CONNECTIONS` | `10` | 인스턴스 하나가 여는 DB 연결 수의 상한 |
+| `REDIS_URL` | — | 인스턴스 사이에 댓글·후원 알림과 송출 종료 신호를 전하는 Redis. 없으면 인스턴스 1개로 보고 프로세스 안에서만 전한다 |
 | `STORAGE_BACKEND` | `local` | 녹화본 저장소. `local` 또는 `oci` |
 | `STORAGE_DIR` | `data/recordings` | local 저장소 디렉터리 |
 | `OCI_S3_ENDPOINT` | — | (oci) S3 호환 엔드포인트 `https://<namespace>.compat.objectstorage.<region>.oraclecloud.com` |
@@ -375,7 +497,10 @@ cargo run -p server
 | `STORAGE_QUOTA_BYTES` | `16106127360` (15GiB) | 저장된 녹화본 크기 합의 한도. 등록은 넘으면 507, 라이브는 닿으면 종료 |
 | `LIVE_DIR` | `data/live` | 라이브 HLS 조각을 만드는 임시 디렉터리. 녹화본을 만든 뒤 지운다 |
 | `FFMPEG_PATH` | `ffmpeg` | 송출을 HLS로 바꾸는 ffmpeg 실행 파일 |
-| `MAX_LIVE_BROADCASTS` | `2` | 동시에 진행할 수 있는 라이브 방송 수(송출마다 ffmpeg가 CPU로 인코딩) |
+| `MAX_LIVE_BROADCASTS` | `2` | 서비스 전체(모든 인스턴스 합)에서 동시에 진행할 수 있는 라이브 방송 수(송출마다 ffmpeg가 CPU로 인코딩) |
+| `INSTANCE_ID` | 호스트 이름 | 서버 인스턴스 이름. 컨테이너에서는 컨테이너 ID가 된다 |
+| `LIVE_HEARTBEAT_INTERVAL_SECS` | `5` | 송출 중인 인스턴스가 하트비트를 갱신하고, 끊긴 라이브를 찾는 주기 |
+| `LIVE_HEARTBEAT_TIMEOUT_SECS` | `30` | 하트비트가 이만큼 끊긴 라이브 방송은 송출받던 인스턴스가 죽은 것으로 보고 종료 |
 | `LIVE_IDLE_TIMEOUT_SECS` | `20` | 송출 중 영상이 이 시간 동안 오지 않으면 방송 종료 |
 | `JWT_SECRET` | (없음, 임시 키) | 로그인 토큰(JWT) 서명 키. 실제 값은 실행 환경에만 둔다. 예: `openssl rand -base64 48`로 만든 값. 비우면 시작할 때마다 임시 키를 만든다(재시작하면 모두 로그아웃) |
 | `JWT_TTL_SECS` | `86400` (24시간) | 로그인 토큰 유효 시간 |
@@ -385,6 +510,14 @@ cargo run -p server
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:8080` | 허용할 웹 출처(쉼표 구분, `*`는 전체) |
 | `WEB_DIST_DIR` | (없음) | 빌드된 웹 정적 파일 디렉터리. 지정하면 서버가 웹 화면도 서빙한다(배포·터널용) |
 | `SITE_ADDRESS` | (없음, HTTP :80) | (Docker Compose의 Caddy) HTTPS 주소. 예: `158-101-1-2.sslip.io` |
+| `POSTGRES_PASSWORD` | — (compose 필수) | (Docker Compose) PostgreSQL 비밀번호. compose가 `DATABASE_URL`을 만들어 app에 넣는다 |
+| `HTTP_PORT` / `HTTPS_PORT` | `80` / `443` | (Docker Compose) Caddy가 호스트에 여는 포트 |
+| `APP_CPUS` | `1` | (Docker Compose) app 인스턴스 하나가 쓸 수 있는 CPU 코어 수. 스케일러의 CPU 100%가 이 값 기준이다 |
+| `AUTOSCALER_MIN` / `AUTOSCALER_MAX` | `1` / `5` | (오토스케일러) app 인스턴스 수의 최소·최대 |
+| `AUTOSCALER_TARGET_CPU` | `50` | (오토스케일러) 인스턴스 하나의 목표 CPU 사용률(%, 코어 1개 = 100) |
+| `AUTOSCALER_INTERVAL_SECS` | `10` | (오토스케일러) CPU를 재고 판단하는 주기 |
+| `AUTOSCALER_SCALE_DOWN_STABILIZATION_SECS` | `60` | (오토스케일러) 줄이기 전에 기다리는 시간. 이 시간 동안의 원하는 수 중 가장 큰 값까지만 줄인다 |
+| `LOAD_VUS` / `LOAD_DURATION` | `40` / `3m` | (k6 부하) 가상 사용자 수와 시간 |
 | `API_BASE_URL` | `http://localhost:3000` | (웹 빌드 시) 웹이 호출할 서버 주소. 비우면 웹을 연 주소와 같은 출처로 부른다 |
 
 ## 녹화본 저장소
@@ -478,26 +611,33 @@ cargo run -p server
 
 OCI(오사카 리전) Always Free 범위 안에서 A1 VM 1대 + 비공개 Object Storage 버킷으로 배포한다. 콘솔에서 자원을 만드는 순서, sslip.io HTTPS 설정, 과금 확인 포인트는 [docs/deploy-oci.md](docs/deploy-oci.md)에 있다.
 
-VM에서는 Docker Compose로 앱(ffmpeg 포함)과 Caddy 리버스 프록시를 띄운다. 앱 컨테이너 하나가 API, 송출 WebSocket, 빌드된 웹 화면을 같은 주소로 서빙한다.
+VM에서도 [로컬 오토스케일 실행](#로컬-오토스케일-실행-과제-5)과 같은 `compose.yaml`(PostgreSQL, Redis, 앱 인스턴스들, Caddy, 오토스케일러)을 띄운다. 앱 인스턴스 하나가 API, 송출 WebSocket, 빌드된 웹 화면을 같은 주소로 서빙한다. 과제 5는 클라우드 배포를 요구하지 않아 OCI에는 다시 배포하지 않았다.
 
 ```bash
-cp .env.example .env   # STORAGE_BACKEND=oci, OCI_* 값, SITE_ADDRESS, JWT_SECRET, TOSS_* 테스트 키를 채운다(커밋 금지)
+cp .env.example .env   # POSTGRES_PASSWORD, JWT_SECRET, STORAGE_BACKEND=oci, OCI_* 값, SITE_ADDRESS, TOSS_* 테스트 키, AUTOSCALER_MAX=2를 채운다(커밋 금지)
 docker compose up -d --build
 ```
 
 ## 테스트
 
 ```bash
-cargo test -p server
+# 테스트용 PostgreSQL과 Redis (로컬 실행의 chzzk-dev-pg를 그대로 써도 된다)
+docker run -d --name chzzk-test-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17
+docker run -d --name chzzk-test-redis -p 6379:6379 redis:7
+cargo test -p server -p autoscaler
 ```
 
-서버 통합 테스트 97개와 단위 테스트 1개. 테스트마다 임시 SQLite 파일, 임시 저장소, 임시 라이브 디렉터리를 쓰며, 테스트용 서명 키(`test-only-jwt-secret`)와 결제 키(`test_sk_fake_…`)는 실제 비밀 값이 아니다. 송출 테스트는 ffmpeg가 필요하다.
+테스트는 `TEST_DATABASE_URL`(기본 `postgres://postgres:postgres@localhost:5432/postgres`)의 PostgreSQL 서버에 테스트마다 새 데이터베이스를 만들고 끝나면 지운다. 여러 인스턴스 테스트는 `TEST_REDIS_URL`(기본 `redis://localhost:6379`)을 쓴다.
 
-- `tests/donations.rs`(29개): 토스페이먼츠 대신 같은 응답 형식의 **가짜 결제 서버**를 실제 포트에 띄운다(승인 요청 수, 시크릿 키 Basic 인증까지 확인). 주문 거절(401·400·409·404·503)과 받는 사람, 승인 성공, 같은 승인 확인 재요청·동시 요청이 한 건, 금액 조작은 승인 API를 부르지 않고 실패, 승인 거절·응답 금액 불일치·다른 주문의 결제 키 거절, 남의 주문 403, 실패·취소 통지, 확정된 후원은 실패로 바뀌지 않음, 결제 중 방송 종료는 승인 안 함, 웹훅만으로 확정·같은 웹훅 반복·승인 확인↔웹훅 순서 무관 한 건, 꾸민 웹훅 본문 무시, 실패·만료·취소 웹훅, 모르는 결제·다른 이벤트 무시, 결제 서비스 장애 시 502, 내역·합계(확정만, 최신순), 끝난 방송의 내역, 실시간 알림 한 번, 후원받은 방송 삭제 409
+서버 통합 테스트 105개와 단위 테스트 1개, 오토스케일러 단위 테스트 10개. 테스트마다 새 DB, 임시 저장소, 임시 라이브 디렉터리를 쓰며, 테스트용 서명 키(`test-only-jwt-secret`)와 결제 키(`test_sk_fake_…`)는 실제 비밀 값이 아니다. 송출 테스트는 ffmpeg가 필요하다.
+
+- `tests/cluster.rs`(9개, 과제 5): 같은 DB·Redis·공유 디렉터리를 쓰는 **서버 인스턴스 두 개(A·B)**를 실제 포트에 띄운다. A에서 받은 토큰을 B가 받아들이고 A의 로그아웃이 B에도 적용, A로 쓴 댓글·삭제를 B의 WebSocket이 받음, 방송 삭제 시 B의 댓글 연결도 닫힘, A가 송출받는 라이브를 B에서 보고(HLS) 종료하면 송출이 끝나고 녹화본이 남음, 새 인스턴스가 떠도 다른 인스턴스의 라이브는 유지, 하트비트가 끊긴 라이브는 다른 인스턴스가 종료·녹화본 정리, 송출 중에는 하트비트가 갱신되어 정리되지 않음, 동시 라이브 수를 A·B 합으로 셈, `/healthz`와 정상 종료(송출을 이유와 함께 끝내고 녹화본까지 만든 뒤 503)
+- `apps/autoscaler`(10개): 목표 대비 늘리기·줄이기, 허용 오차, 최소·최대, 인스턴스 0개, 줄이기 안정화 시간, 송출 중·응답 없는·내려가는 인스턴스는 줄이지 않음, 나중에 생긴 인스턴스부터 줄임
+- `tests/donations.rs`(30개): 토스페이먼츠 대신 같은 응답 형식의 **가짜 결제 서버**를 실제 포트에 띄운다(승인 요청 수, 시크릿 키 Basic 인증까지 확인). 주문 거절(401·400·409·404·503)과 받는 사람, 승인 성공, 같은 승인 확인 재요청·동시 요청이 한 건, 금액 조작은 승인 API를 부르지 않고 실패, 승인 거절·응답 금액 불일치·다른 주문의 결제 키 거절, 남의 주문 403, 실패·취소 통지, 확정된 후원은 실패로 바뀌지 않음, 결제 중 방송 종료는 승인 안 함, 웹훅만으로 확정·같은 웹훅 반복·승인 확인↔웹훅 순서 무관 한 건, 꾸민 웹훅 본문 무시, 실패·만료·취소 웹훅, 모르는 결제·다른 이벤트 무시, 결제 서비스 장애 시 502, 내역·합계(확정만, 최신순), 끝난 방송의 내역, 실시간 알림 한 번, 후원받은 방송 삭제 409, 다른 인스턴스에서 확정된 후원 알림
 - `tests/auth.rs`(9개): 회원가입·로그인·로그아웃, 잘못·만료·폐기된 토큰 401, 임시 서명 키
-- `tests/api.rs`(31개): 과제 1·2 등록·목록·상세·재생·거부·재시작·웹 서빙·상태, 소유자 권한 표(401·403·허용), 삭제·종료 409, 과제 2 DB의 마이그레이션
+- `tests/api.rs`(30개): 과제 1·2 등록·목록·상세·재생·거부·재시작·웹 서빙·상태, 소유자 권한 표(401·403·허용), 삭제·종료 409
 - `tests/comments.rs`(11개): 댓글 작성·목록·삭제 권한, 댓글 WebSocket 알림
-- `tests/live.rs`(17개): 실제 포트에서 ffmpeg webm을 WebSocket으로 송출 → HLS → 종료 → 녹화본, 시작 거부, 소유자 원격 종료, 재시작 복구
+- `tests/live.rs`(17개): 실제 포트에서 ffmpeg webm을 WebSocket으로 송출 → HLS → 종료 → 녹화본, 시작 거부, 소유자 원격 종료, 하트비트가 끊긴 방송의 시작 시 정리
 
 웹 앱은 컴파일로 확인한다.
 

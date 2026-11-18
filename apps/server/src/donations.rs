@@ -350,12 +350,15 @@ pub(crate) async fn finalize(
     let Json(donation) = confirmed(&current)?;
     let newly_confirmed = outcome == ConfirmOutcome::Confirmed;
     if newly_confirmed {
-        state.comments.publish(
-            donation.broadcast_id,
-            CommentEvent::Donated {
-                donation: donation.clone(),
-            },
-        );
+        state
+            .bus
+            .publish(
+                donation.broadcast_id,
+                CommentEvent::Donated {
+                    donation: donation.clone(),
+                },
+            )
+            .await;
     }
     Ok((donation, newly_confirmed))
 }

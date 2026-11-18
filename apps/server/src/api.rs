@@ -141,7 +141,7 @@ async fn delete_broadcast(
         DeleteOutcome::NotFound => return Err(broadcast_not_found()),
     };
     tracing::info!(broadcast = %id, "방송 삭제: {}", stored.broadcast.title);
-    state.comments.close(id);
+    state.bus.broadcast_deleted(id).await;
     if let Some(location) = location {
         delete_recording_object(&state, &location).await;
     }
@@ -174,7 +174,7 @@ async fn delete_recording_object(state: &AppState, location: &RecordingLocation)
 }
 
 /// 라이브 종료. 소유자만 할 수 있다. 송출하던 기기가 아닌 곳에서도 방송을 끝낼 수 있다.
-/// 송출 연결에는 종료를 알리고, 송출 연결은 평소처럼 녹화본을 만든다.
+/// 송출 연결에는 (어느 인스턴스에 붙어 있든) 종료를 알리고, 송출 연결은 평소처럼 녹화본을 만든다.
 async fn end_broadcast(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -191,10 +191,8 @@ async fn end_broadcast(
     // 상태를 먼저 종료로 바꿔 응답에 바로 반영한다. 송출 연결이 기록할 때는 이미 종료라 그대로 둔다.
     let ended_at = Utc::now();
     db::end_broadcast(&state.db, broadcast.id, ended_at).await?;
-    if !state.live.request_stop(broadcast.id) {
-        // 송출 연결이 막 끝나는 중이었다. 그 연결이 녹화본을 마무리한다.
-        tracing::info!(broadcast = %broadcast.id, "종료할 송출 연결이 이미 없습니다");
-    }
+    // 송출 연결은 다른 인스턴스에 붙어 있을 수 있으므로 모든 인스턴스에 알린다.
+    state.bus.stop_ingest(broadcast.id).await;
     tracing::info!(broadcast = %broadcast.id, "소유자가 라이브 방송을 종료했습니다");
     broadcast.status = BroadcastStatus::Ended;
     broadcast.ended_at = Some(ended_at);

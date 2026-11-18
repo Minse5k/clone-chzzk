@@ -18,17 +18,21 @@ use shared::{
 };
 use tempfile::TempDir;
 
-const TEST_JWT_SECRET: &str = "test-only-jwt-secret";
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+mod common;
+
+use common::{TEST_JWT_SECRET, TestDatabase};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// 임시 DB·저장소·라이브 디렉터리를 쓰고 실제 포트에서 요청을 받는 서버.
 struct LiveServer {
     dir: TempDir,
+    db: TestDatabase,
     app: Router,
     addr: SocketAddr,
     /// 기본 송출자. 서버를 띄울 때 가입한다.
@@ -53,14 +57,17 @@ impl LiveServer {
     /// 기본 설정을 고쳐서 서버를 띄운다.
     async fn with_config(edit: impl FnOnce(&mut server::Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = Self::config(&dir);
+        let db = TestDatabase::create().await;
+        let mut config = Self::config(&dir, &db);
         edit(&mut config);
-        Self::serve(dir, config).await
+        Self::serve(dir, db, config).await
     }
 
-    fn config(dir: &TempDir) -> server::Config {
+    fn config(dir: &TempDir, db: &TestDatabase) -> server::Config {
         server::Config {
-            database_path: dir.path().join("test.db"),
+            database_url: db.url.as_str().into(),
+            database_max_connections: 5,
+            redis_url: None,
             storage: server::StorageConfig::Local {
                 dir: dir.path().join("recordings"),
             },
@@ -71,6 +78,9 @@ impl LiveServer {
             live_dir: dir.path().join("live"),
             ffmpeg_path: "ffmpeg".into(),
             max_live_broadcasts: 2,
+            instance_id: "test-instance".into(),
+            live_heartbeat_interval: std::time::Duration::from_secs(5),
+            live_heartbeat_timeout: std::time::Duration::from_secs(30),
             live_idle_timeout: Duration::from_secs(20),
             jwt_secret: Some(TEST_JWT_SECRET.into()),
             jwt_ttl: std::time::Duration::from_secs(3600),
@@ -78,7 +88,7 @@ impl LiveServer {
         }
     }
 
-    async fn serve(dir: TempDir, config: server::Config) -> Self {
+    async fn serve(dir: TempDir, db: TestDatabase, config: server::Config) -> Self {
         let app = server::build_app(config).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -86,6 +96,7 @@ impl LiveServer {
         let owner = signup(&app, "owner").await;
         Self {
             dir,
+            db,
             app,
             addr,
             owner,
@@ -146,28 +157,13 @@ impl LiveServer {
 
     /// 다른 방송의 녹화본이 저장 총량 한도를 모두 차지한 상태로 만든다.
     async fn use_up_quota(&self) {
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(self.dir.path().join("test.db")),
-        )
-        .await
-        .unwrap();
-        let id = Uuid::now_v7().to_string();
-        sqlx::query(
-            "INSERT INTO broadcasts (id, title, owner_id, created_at, ended_at) \
-             VALUES (?, '큰 방송', ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(self.owner.user.id.to_string())
-        .bind("2026-11-12T09:00:00.000000Z")
-        .bind("2026-11-12T09:00:00.000000Z")
-        .execute(&pool)
-        .await
-        .unwrap();
+        let id = common::insert_broadcast(&self.db, self.owner.user.id, "큰 방송", true).await;
+        let pool = self.db.pool().await;
         sqlx::query(
             "INSERT INTO recordings (broadcast_id, storage_backend, object_key, content_type, size_bytes) \
-             VALUES (?, 'local', 'big.mp4', 'video/mp4', ?)",
+             VALUES ($1, 'local', 'big.mp4', 'video/mp4', $2)",
         )
-        .bind(&id)
+        .bind(id)
         .bind(1024_i64 * 1024 * 1024)
         .execute(&pool)
         .await
@@ -594,58 +590,46 @@ async fn 영상이_한동안_오지_않으면_서버가_방송을_종료한다()
 }
 
 #[tokio::test]
-async fn 서버가_송출_도중_멈췄다면_다시_시작할_때_방송을_종료하고_남은_영상을_녹화본으로_만든다() {
+async fn 송출하던_인스턴스가_멈춰_하트비트가_끊긴_방송은_서버가_시작할_때_종료하고_남은_영상을_녹화본으로_만든다()
+ {
     let dir = tempfile::tempdir().unwrap();
-    let config = LiveServer::config(&dir);
+    let db = TestDatabase::create().await;
+    let config = LiveServer::config(&dir, &db);
 
-    // 서버가 멈추기 전 상태: 라이브 중인 방송 둘. 하나는 HLS 조각이 남아 있고 하나는 없다.
+    // 서버가 멈추기 전 상태: 하트비트가 끊긴 라이브 중인 방송 둘. 하나는 HLS 조각이 남아 있고 하나는 없다.
     drop(server::build_app(config.clone()).await.unwrap());
-    let pool = sqlx::SqlitePool::connect_with(
-        sqlx::sqlite::SqliteConnectOptions::new().filename(&config.database_path),
-    )
-    .await
-    .unwrap();
-    let with_video = Uuid::now_v7();
-    let without_video = Uuid::now_v7();
-    let owner_id = Uuid::now_v7().to_string();
+    let pool = db.pool().await;
+    let owner_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO users (id, username, password_hash, created_at) \
-         VALUES (?, 'earlier_owner', 'unused', '2026-11-12T09:00:00.000000Z')",
+         VALUES ($1, 'earlier_owner', 'unused', now())",
     )
-    .bind(&owner_id)
+    .bind(owner_id)
     .execute(&pool)
     .await
     .unwrap();
-    for (id, title) in [
-        (with_video, "조각이 남은 방송"),
-        (without_video, "조각이 없는 방송"),
-    ] {
-        sqlx::query("INSERT INTO broadcasts (id, title, owner_id, created_at) VALUES (?, ?, ?, ?)")
-            .bind(id.to_string())
-            .bind(title)
-            .bind(&owner_id)
-            .bind("2026-11-12T09:00:00.000000Z")
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
     pool.close().await;
+    let stopped_ago = Duration::from_secs(60 * 60);
+    let with_video = common::insert_ingesting_broadcast(
+        &db,
+        owner_id,
+        "조각이 남은 방송",
+        "dead-instance",
+        stopped_ago,
+    )
+    .await;
+    let without_video = common::insert_ingesting_broadcast(
+        &db,
+        owner_id,
+        "조각이 없는 방송",
+        "dead-instance",
+        stopped_ago,
+    )
+    .await;
     let live_dir = config.live_dir.join(with_video.to_string());
-    std::fs::create_dir_all(&live_dir).unwrap();
-    let status = std::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error"])
-        .args(["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30"])
-        .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
-        .args(["-t", "3", "-c:v", "libx264", "-c:a", "aac"])
-        .args(["-f", "hls", "-hls_time", "1", "-hls_list_size", "0"])
-        .arg("-hls_segment_filename")
-        .arg(live_dir.join("seg%05d.ts"))
-        .arg(live_dir.join("index.m3u8"))
-        .status()
-        .unwrap();
-    assert!(status.success());
+    common::write_hls_fragments(&live_dir);
 
-    let server = LiveServer::serve(dir, config).await;
+    let server = LiveServer::serve(dir, db, config).await;
 
     let recovered = server.broadcast(with_video).await;
     assert_eq!(recovered.status, BroadcastStatus::Ended);

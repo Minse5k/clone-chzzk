@@ -203,6 +203,14 @@ async fn fake_get(
     }
 }
 
+fn toss_config(api_base: &str) -> server::TossConfig {
+    server::TossConfig {
+        client_key: CLIENT_KEY.into(),
+        secret_key: SECRET_KEY.into(),
+        api_base: api_base.into(),
+    }
+}
+
 /// 라이브 방송 하나와 방송자, 시청자, 가짜 결제 서버가 있는 서버.
 struct DonationFixture {
     app: TestApp,
@@ -215,14 +223,18 @@ struct DonationFixture {
 impl DonationFixture {
     async fn new() -> Self {
         let (toss, api_base) = FakeToss::start().await;
-        let app = TestApp::with_config(|config| {
-            config.toss = Some(server::TossConfig {
-                client_key: CLIENT_KEY.into(),
-                secret_key: SECRET_KEY.into(),
-                api_base,
-            });
-        })
-        .await;
+        let app = TestApp::with_config(|config| config.toss = Some(toss_config(&api_base))).await;
+        Self::with_app(app, toss).await
+    }
+
+    /// 같은 DB·Redis를 쓰는 서버 인스턴스 둘. 후원은 `app`(A)으로 하고, 다른 인스턴스(B)를 함께 돌려준다.
+    async fn cluster() -> (Self, TestApp) {
+        let (toss, api_base) = FakeToss::start().await;
+        let (a, b) = TestApp::cluster(|config| config.toss = Some(toss_config(&api_base))).await;
+        (Self::with_app(a, toss).await, b)
+    }
+
+    async fn with_app(app: TestApp, toss: FakeToss) -> Self {
         let streamer = app.signup("streamer").await;
         let viewer = app.signup("viewer").await;
         let broadcast = app
@@ -351,7 +363,7 @@ impl DonationFixture {
     /// 주문의 현재 상태(DB 값).
     async fn status(&self, order_id: &str) -> String {
         let pool = self.app.pool().await;
-        let status = sqlx::query_scalar("SELECT status FROM donations WHERE order_id = ?")
+        let status = sqlx::query_scalar("SELECT status FROM donations WHERE order_id = $1")
             .bind(order_id)
             .fetch_one(&pool)
             .await
@@ -364,7 +376,7 @@ impl DonationFixture {
     async fn confirmed_total(&self) -> (i64, i64) {
         let pool = self.app.pool().await;
         let total = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM donations WHERE status = 'confirmed'",
+            "SELECT COUNT(*), COALESCE(SUM(amount), 0)::BIGINT FROM donations WHERE status = 'confirmed'",
         )
         .fetch_one(&pool)
         .await
@@ -1098,4 +1110,29 @@ async fn 후원이_확정되면_시청_화면에_한_번만_알린다() {
         next_event(&mut socket).await,
         CommentEvent::Created { .. }
     ));
+}
+
+#[tokio::test]
+async fn 다른_인스턴스에서_확정된_후원도_시청_화면에_알린다() {
+    let (fixture, other) = DonationFixture::cluster().await;
+    let url = format!("ws://{}{}", other.addr, comments_ws_path(fixture.broadcast));
+    let mut socket = tokio_tungstenite::connect_async(url).await.unwrap().0;
+    let order = fixture.order(3_000, "다른 인스턴스로 후원").await;
+    let payment_key = fixture
+        .toss
+        .authorize(&order.order_id, 3_000, OnConfirm::Approve);
+
+    let donation: Donation = fixture
+        .confirm(&payment_key, &order.order_id, 3_000)
+        .await
+        .json();
+
+    assert_eq!(
+        next_event(&mut socket).await,
+        CommentEvent::Donated { donation }
+    );
+    // 합계도 어느 인스턴스로 보든 같다.
+    let summary: shared::DonationSummary =
+        other.get(&donations_path(fixture.broadcast)).await.json();
+    assert_eq!((summary.total_amount, summary.count), (3_000, 1));
 }

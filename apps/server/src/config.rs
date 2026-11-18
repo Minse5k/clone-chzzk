@@ -5,8 +5,12 @@ use anyhow::Context;
 /// 서버 설정. 실행 시에는 환경변수에서 읽고, 테스트에서는 직접 만든다.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// SQLite 파일 경로. 없으면 새로 만든다.
-    pub database_path: PathBuf,
+    /// PostgreSQL 연결 주소. 모든 서버 인스턴스가 같은 DB를 쓴다.
+    pub database_url: ConnectionUrl,
+    /// 인스턴스 하나가 여는 DB 연결 수의 상한.
+    pub database_max_connections: u32,
+    /// 인스턴스 사이에 알림을 전하는 Redis 주소. 없으면 인스턴스 하나로 보고 프로세스 안에서만 전한다.
+    pub redis_url: Option<ConnectionUrl>,
     /// 녹화본 저장소.
     pub storage: StorageConfig,
     /// 브라우저 호출을 허용할 웹 출처. `*`이면 모두 허용한다.
@@ -21,8 +25,15 @@ pub struct Config {
     pub live_dir: PathBuf,
     /// 송출을 HLS로 바꾸는 ffmpeg 실행 파일.
     pub ffmpeg_path: PathBuf,
-    /// 동시에 진행할 수 있는 라이브 방송 수. 송출마다 ffmpeg가 CPU로 인코딩하므로 VM에 맞춘다.
+    /// 서비스 전체(모든 인스턴스 합)에서 동시에 진행할 수 있는 라이브 방송 수.
+    /// 송출마다 ffmpeg가 CPU로 인코딩하므로 머신에 맞춘다.
     pub max_live_broadcasts: usize,
+    /// 이 서버 인스턴스의 이름. 라이브 방송을 어느 인스턴스가 송출받는지 기록할 때 쓴다.
+    pub instance_id: String,
+    /// 송출 중인 인스턴스가 하트비트를 갱신하고, 끊긴 라이브 방송을 찾는 주기.
+    pub live_heartbeat_interval: Duration,
+    /// 하트비트가 이만큼 끊긴 라이브 방송은 송출받던 인스턴스가 죽은 것으로 보고 종료한다.
+    pub live_heartbeat_timeout: Duration,
     /// 송출 중에 녹화 조각이 이 시간 동안 오지 않으면 방송을 종료한다.
     pub live_idle_timeout: Duration,
     /// 로그인 토큰(JWT)의 서명 키. 비우면 서버를 시작할 때마다 임시 키를 만든다(재시작하면 모두 로그아웃).
@@ -89,6 +100,22 @@ impl std::fmt::Debug for JwtSecret {
 impl From<&str> for JwtSecret {
     fn from(secret: &str) -> Self {
         Self(secret.to_owned())
+    }
+}
+
+/// DB·Redis 연결 주소. 비밀번호가 들어 있을 수 있으므로 로그나 디버그 출력에 드러나지 않게 감싼다.
+#[derive(Clone)]
+pub struct ConnectionUrl(pub String);
+
+impl std::fmt::Debug for ConnectionUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConnectionUrl(<숨김>)")
+    }
+}
+
+impl From<&str> for ConnectionUrl {
+    fn from(url: &str) -> Self {
+        Self(url.to_owned())
     }
 }
 
@@ -167,7 +194,20 @@ const GIB: u64 = 1024 * 1024 * 1024;
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
-            database_path: env_or("DATABASE_PATH", "data/chzzk.db").into(),
+            database_url: env::var("DATABASE_URL")
+                .ok()
+                .map(|url| url.trim().to_owned())
+                .filter(|url| !url.is_empty())
+                .map(ConnectionUrl)
+                .context(
+                    "DATABASE_URL이 필요합니다 (예: postgres://chzzk:<비밀번호>@localhost:5432/chzzk)",
+                )?,
+            database_max_connections: env_number("DATABASE_MAX_CONNECTIONS", 10)?,
+            redis_url: env::var("REDIS_URL")
+                .ok()
+                .map(|url| url.trim().to_owned())
+                .filter(|url| !url.is_empty())
+                .map(ConnectionUrl),
             storage: StorageConfig::from_env()?,
             cors_allowed_origins: env_or("CORS_ALLOWED_ORIGINS", "http://localhost:8080")
                 .split(',')
@@ -183,6 +223,15 @@ impl Config {
             live_dir: env_or("LIVE_DIR", "data/live").into(),
             ffmpeg_path: env_or("FFMPEG_PATH", "ffmpeg").into(),
             max_live_broadcasts: env_number("MAX_LIVE_BROADCASTS", 2)?,
+            instance_id: instance_id_from_env(),
+            live_heartbeat_interval: Duration::from_secs(env_number(
+                "LIVE_HEARTBEAT_INTERVAL_SECS",
+                5,
+            )?),
+            live_heartbeat_timeout: Duration::from_secs(env_number(
+                "LIVE_HEARTBEAT_TIMEOUT_SECS",
+                30,
+            )?),
             live_idle_timeout: Duration::from_secs(env_number("LIVE_IDLE_TIMEOUT_SECS", 20)?),
             jwt_secret: env::var("JWT_SECRET")
                 .ok()
@@ -193,6 +242,16 @@ impl Config {
             toss: TossConfig::from_env()?,
         })
     }
+}
+
+/// `INSTANCE_ID`, 없으면 호스트 이름(컨테이너에서는 컨테이너 ID), 그것도 없으면 무작위 이름.
+fn instance_id_from_env() -> String {
+    ["INSTANCE_ID", "HOSTNAME"]
+        .iter()
+        .filter_map(|key| env::var(key).ok())
+        .map(|value| value.trim().to_owned())
+        .find(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("instance-{}", uuid::Uuid::now_v7().simple()))
 }
 
 fn env_number<T: std::str::FromStr>(key: &str, default: T) -> anyhow::Result<T> {

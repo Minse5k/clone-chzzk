@@ -210,11 +210,7 @@ async fn 방송을_지우면_댓글도_지워진다() {
             .status,
         StatusCode::NOT_FOUND
     );
-    let pool = sqlx::SqlitePool::connect_with(
-        sqlx::sqlite::SqliteConnectOptions::new().filename(fixture.app.dir.path().join("test.db")),
-    )
-    .await
-    .unwrap();
+    let pool = fixture.app.pool().await;
     let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM comments")
         .fetch_one(&pool)
         .await

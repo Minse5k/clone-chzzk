@@ -3,7 +3,7 @@
 clone-chzzk를 Oracle Cloud(OCI)에 **Always Free 한도 안에서** 배포하는 순서다. 콘솔에서 직접 자원을 만들고, VM에서 Docker Compose로 앱을 띄운다.
 
 - 리전: **Japan Central (Osaka, `ap-osaka-1`)** — 홈 리전. Always Free 자원은 홈 리전에서만 무료다.
-- 구성: A1 VM 1대(앱 + ffmpeg + Caddy) + 비공개 Object Storage 버킷(녹화본)
+- 구성: A1 VM 1대(Docker Compose: PostgreSQL + Redis + 앱 인스턴스들 + Caddy + 오토스케일러) + 비공개 Object Storage 버킷(녹화본)
 - 접속: `https://<공인IP를 대시로>.sslip.io`. 휴대폰 브라우저는 HTTPS에서만 카메라·마이크를 허용하므로, 도메인 없이 sslip.io 주소에 Caddy가 Let's Encrypt 인증서를 자동으로 붙인다(무료).
 
 > ⚠️ **과금 위험 — 먼저 읽기**
@@ -20,6 +20,8 @@ clone-chzzk를 Oracle Cloud(OCI)에 **Always Free 한도 안에서** 배포하�
 > 라이브 송출은 방송마다 ffmpeg가 A1 CPU로 다시 인코딩한다(720p 기준 OCPU 1개 안팎). 2 OCPU VM에서는 `MAX_LIVE_BROADCASTS=2`(기본값)를 넘기지 않는다. CPU를 더 쓴다고 과금되지는 않지만, 넘치면 모든 방송이 끊긴다.
 >
 > 다른 VM·볼륨·버킷이 이미 있다면 그 사용량도 합산된다.
+>
+> 과제 5부터 `compose.yaml`은 앱을 여러 인스턴스로 띄우는 오토스케일 구성이다. 인스턴스가 늘어도 같은 VM 안에서 CPU를 나눠 쓸 뿐 OCI 자원이 새로 생기지는 않는다(과금 없음). 2 OCPU VM에서는 `.env`에 `AUTOSCALER_MAX=2`를 두어 인스턴스를 2개까지만 띄운다.
 
 ## 0. 예산 알림 만들기 (권장, 무료)
 
@@ -136,18 +138,22 @@ OCI_ACCESS_KEY_ID=<Access Key>
 OCI_SECRET_ACCESS_KEY=<Secret Key>
 # 휴대폰 송출용 HTTPS 주소. 공인 IP의 점(.)을 대시(-)로 바꾼다. 예: 공인 IP 158.101.1.2 → 158-101-1-2.sslip.io
 SITE_ADDRESS=<공인IP를 대시로>.sslip.io
-# 로그인 토큰 서명 키. 아래 명령으로 만든 값을 넣는다(저장소에 커밋하지 않는다).
+# 로그인 토큰 서명 키(필수). 아래 명령으로 만든 값을 넣는다(저장소에 커밋하지 않는다).
 JWT_SECRET=<openssl rand -base64 48 결과>
+# PostgreSQL 비밀번호(필수). openssl rand -hex 24 로 만든 값을 넣는다.
+POSTGRES_PASSWORD=<openssl rand -hex 24 결과>
+# 2 OCPU VM에서는 앱 인스턴스를 2개까지만 띄운다.
+AUTOSCALER_MAX=2
 # 후원 결제: 토스페이먼츠 결제위젯 테스트 키(test_로 시작). 라이브 키는 넣지 않는다.
 TOSS_CLIENT_KEY=<테스트 클라이언트 키>
 TOSS_SECRET_KEY=<테스트 시크릿 키>
 ```
 
-> `JWT_SECRET`은 VM에서 `openssl rand -base64 48`로 만든다. 비워 두면 서버가 시작할 때마다 임시 키를 만들어, 재배포·재시작할 때마다 모든 사용자가 로그아웃된다.
+> `JWT_SECRET`은 VM에서 `openssl rand -base64 48`로 만든다. 여러 인스턴스가 같은 키를 써야 하므로 compose는 이 값이 비어 있으면 시작하지 않는다. `POSTGRES_PASSWORD`도 마찬가지다.
 
 > sslip.io는 `158-101-1-2.sslip.io` 같은 이름을 그 IP로 돌려주는 무료 DNS다. 가입이나 설정이 없다. Caddy는 이 이름으로 Let's Encrypt 인증서를 받으므로 80·443 포트가 열려 있어야 한다(1·5단계).
 
-> `DATABASE_PATH`, `STORAGE_DIR`, `SERVER_ADDR`, `WEB_DIST_DIR`는 `compose.yaml`이 컨테이너 경로로 고정하므로 `.env`의 값은 쓰이지 않는다. `API_BASE_URL`, `CORS_ALLOWED_ORIGINS`도 같은 출처로 서빙되는 배포에서는 쓰이지 않는다.
+> `DATABASE_URL`, `REDIS_URL`, `STORAGE_DIR`, `SERVER_ADDR`, `WEB_DIST_DIR`는 `compose.yaml`이 컨테이너 안의 값으로 고정하므로 `.env`의 값은 쓰이지 않는다. `API_BASE_URL`, `CORS_ALLOWED_ORIGINS`도 같은 출처로 서빙되는 배포에서는 쓰이지 않는다.
 
 빌드하고 실행한다. 첫 빌드는 Dioxus CLI와 의존성을 컴파일하느라 20분 이상 걸릴 수 있다.
 
@@ -203,10 +209,18 @@ git pull
 docker compose up -d --build
 ```
 
-DB(SQLite)는 `app-data` 볼륨에 있어 재배포해도 유지된다. 단, 과제 3을 처음 배포하면 로그인 도입 전(과제 1·2)의 방송은 소유자가 없어 마이그레이션에서 지워지고, 그 녹화본도 서버가 시작할 때 버킷에서 지운다. 백업은 다음처럼 한다.
+DB(PostgreSQL)는 `postgres-data` 볼륨에 있어 재배포해도 유지된다. 과제 4 이전의 SQLite DB(`app-data` 볼륨의 `chzzk.db`)는 옮기지 않으므로, 과제 5를 처음 배포하면 새 DB로 시작한다(필요하면 아래처럼 먼저 백업해 둔다). 과제 4까지는 compose 프로젝트 이름이 디렉터리 이름이었고 과제 5부터 `chzzk`로 고정했으므로, 처음 배포할 때는 옛 컨테이너를 먼저 내린다.
 
 ```bash
-docker compose cp app:/data/chzzk.db ./chzzk-backup.db
+# 과제 4 이전 구성의 DB 백업과 옛 컨테이너 정리(과제 5를 처음 배포할 때 한 번)
+docker compose -p clone-chzzk cp app:/data/chzzk.db ./chzzk-backup.db
+docker compose -p clone-chzzk down
+```
+
+PostgreSQL 백업은 다음처럼 한다.
+
+```bash
+docker compose exec postgres pg_dump -U chzzk chzzk > chzzk-backup.sql
 ```
 
 ## 자기 도메인 쓰기 (선택)

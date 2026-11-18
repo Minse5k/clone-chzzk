@@ -1,7 +1,23 @@
 {$SITE_ADDRESS::80} {
+	# 여러 app 인스턴스에 요청을 나눈다(과제 5).
+	# Docker DNS의 `app` A 레코드에 지금 떠 있는 인스턴스가 모두 들어 있어, 1초마다 다시 읽어
+	# 오토스케일러가 늘리거나 줄인 인스턴스를 따라간다.
 	# 녹화본 업로드·재생은 큰 스트림이므로 버퍼링하지 않고 바로 흘려보낸다.
-	# 라이브 송출 WebSocket(/api/live/ingest)도 reverse_proxy가 그대로 중계한다.
-	reverse_proxy app:3000 {
+	# 라이브 송출·댓글 WebSocket도 reverse_proxy가 그대로 중계한다(연결 하나는 한 인스턴스에 붙는다).
+	reverse_proxy {
+		dynamic a {
+			name app
+			port 3000
+			refresh 1s
+			versions ipv4
+		}
+		# 진행 중인 요청이 가장 적은 인스턴스로 보낸다.
+		lb_policy least_conn
+		# 인스턴스가 막 내려가 연결할 수 없으면 다른 인스턴스로 다시 보낸다.
+		lb_try_duration 5s
+		lb_try_interval 250ms
+		# 동적 업스트림에는 능동 헬스 체크가 돌지 않으므로, 연결 실패한 인스턴스를 잠시 빼는 수동 헬스 체크를 쓴다.
+		fail_duration 10s
 		flush_interval -1
 	}
 }

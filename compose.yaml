@@ -1,17 +1,61 @@
-# 배포용 구성: 앱(서버 + 웹) 컨테이너와 그 앞의 Caddy 리버스 프록시.
+# clone-chzzk 로컬 오토스케일 구성(과제 5).
+#
+#   caddy ──(분산)──> app × N ──> postgres (DB)
+#                       │   └──> redis (인스턴스 간 알림)
+#                       └──> app-data 볼륨 (녹화본·라이브 HLS 조각, 모든 인스턴스가 공유)
+#   autoscaler: app의 CPU 사용률을 보고 N을 AUTOSCALER_MIN~MAX 사이로 바꾼다.
+#   k6(load 프로필): 부하 발생기. `docker compose --profile load run --rm k6`
+#
 # 비밀 값은 저장소에 없는 .env 파일로만 넣는다(.env.example 참고).
+name: chzzk
+
 services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: chzzk
+      POSTGRES_DB: chzzk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?.env에 POSTGRES_PASSWORD를 정하세요}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chzzk -d chzzk"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # 서버(API + 웹). container_name·호스트 포트가 없어 `--scale`로 여러 개를 띄울 수 있다.
   app:
     build: .
+    image: chzzk-app:local
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file:
       - path: .env
         required: false
-    # 컨테이너 안의 경로는 이미지에 맞춰 고정한다(.env에 로컬 개발용 값이 있어도 이 값이 우선한다).
+    # 컨테이너 안의 경로와 공용 저장소 주소는 compose가 정한다(.env에 로컬 개발용 값이 있어도 이 값이 우선한다).
+    # INSTANCE_ID는 정하지 않아 인스턴스마다 컨테이너 ID(호스트 이름)를 쓴다.
     environment:
       SERVER_ADDR: 0.0.0.0:3000
       WEB_DIST_DIR: /app/web
-      DATABASE_PATH: /data/chzzk.db
+      DATABASE_URL: postgres://chzzk:${POSTGRES_PASSWORD}@postgres:5432/chzzk
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?.env에 JWT_SECRET을 정하세요(모든 인스턴스가 같은 키를 써야 로그인이 유지됩니다)}
+      INSTANCE_ID: ""
       STORAGE_DIR: /data/recordings
       LIVE_DIR: /data/live
       FFMPEG_PATH: ffmpeg
@@ -19,6 +63,10 @@ services:
       - app-data:/data
     expose:
       - "3000"
+    # 인스턴스 하나가 코어 1개까지 쓴다. 오토스케일러의 CPU 사용률은 이 코어 1개 기준(100%)이다.
+    cpus: ${APP_CPUS:-1}
+    # SIGTERM을 받으면 송출을 마무리하고(녹화본까지) 내려간다. 그 시간을 준다.
+    stop_grace_period: 30s
 
   caddy:
     image: caddy:2
@@ -26,8 +74,8 @@ services:
     depends_on:
       - app
     ports:
-      - "80:80"
-      - "443:443"
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
     environment:
       # 기본은 HTTP(:80). 휴대폰 송출에는 HTTPS가 필요하므로 배포에서는
       # SITE_ADDRESS=<공인IP를 대시로>.sslip.io (예: 158-101-1-2.sslip.io) 또는 자기 도메인을 두면
@@ -38,7 +86,49 @@ services:
       - caddy-data:/data
       - caddy-config:/config
 
+  # 직접 만든 오토스케일러(apps/autoscaler). Docker 소켓으로 app 컨테이너를 재고 늘리고 줄인다.
+  autoscaler:
+    build:
+      context: .
+      dockerfile: apps/autoscaler/Dockerfile
+    image: chzzk-autoscaler:local
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      AUTOSCALER_MIN: ${AUTOSCALER_MIN:-1}
+      AUTOSCALER_MAX: ${AUTOSCALER_MAX:-5}
+      AUTOSCALER_TARGET_CPU: ${AUTOSCALER_TARGET_CPU:-50}
+      AUTOSCALER_INTERVAL_SECS: ${AUTOSCALER_INTERVAL_SECS:-10}
+      AUTOSCALER_SCALE_DOWN_STABILIZATION_SECS: ${AUTOSCALER_SCALE_DOWN_STABILIZATION_SECS:-60}
+      AUTOSCALER_PROJECT: chzzk
+      AUTOSCALER_SERVICE: app
+      # 아래에서 마운트한 이 디렉터리의 compose.yaml로 `up --scale`을 부른다.
+      AUTOSCALER_COMPOSE_FILE: /project/compose.yaml
+      # 새로 띄우는 app이 처음 띄운 app과 같은 설정이 되도록, compose.yaml이 쓰는 값을 그대로 넘긴다.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      APP_CPUS: ${APP_CPUS:-1}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/project:ro
+
+  # 부하 발생기(deploy/load/k6.js). 평소에는 뜨지 않는다: docker compose --profile load run --rm k6
+  k6:
+    image: grafana/k6:1.3.0
+    profiles: ["load"]
+    depends_on:
+      - caddy
+    environment:
+      BASE_URL: http://caddy
+      VUS: ${LOAD_VUS:-40}
+      DURATION: ${LOAD_DURATION:-3m}
+    volumes:
+      - ./deploy/load:/scripts:ro
+    command: ["run", "/scripts/k6.js"]
+
 volumes:
-  app-data: # SQLite 파일, local 저장소 녹화본, 라이브 HLS 조각
+  postgres-data: # DB
+  app-data: # local 저장소 녹화본, 라이브 HLS 조각 (모든 app 인스턴스가 공유)
   caddy-data:
   caddy-config:
