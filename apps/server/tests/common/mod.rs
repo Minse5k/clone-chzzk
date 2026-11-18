@@ -109,6 +109,9 @@ pub fn test_config(dir: &TempDir, db: &TestDatabase) -> server::Config {
         live_dir: dir.path().join("live"),
         ffmpeg_path: "ffmpeg".into(),
         max_live_broadcasts: 2,
+        instance_id: format!("test-{}", Uuid::now_v7().simple()),
+        live_heartbeat_interval: std::time::Duration::from_secs(5),
+        live_heartbeat_timeout: std::time::Duration::from_secs(30),
         live_idle_timeout: std::time::Duration::from_secs(20),
         jwt_secret: Some(TEST_JWT_SECRET.into()),
         jwt_ttl: std::time::Duration::from_secs(3600),
@@ -119,6 +122,8 @@ pub fn test_config(dir: &TempDir, db: &TestDatabase) -> server::Config {
 /// 실제 포트에서도 요청을 받는 테스트 서버. HTTP 요청은 라우터에 바로 보내고,
 /// WebSocket은 `addr`로 연결한다.
 pub struct TestApp {
+    /// 정상 종료 처리를 부를 수 있는 서버 인스턴스.
+    pub server: Arc<server::App>,
     /// 녹화본·라이브 조각 디렉터리. 여러 인스턴스 테스트에서는 공유 볼륨처럼 인스턴스끼리 함께 쓴다.
     pub dir: Arc<TempDir>,
     pub db: Arc<TestDatabase>,
@@ -175,11 +180,18 @@ impl TestApp {
     }
 
     async fn serve(dir: Arc<TempDir>, db: Arc<TestDatabase>, config: server::Config) -> Self {
-        let app = server::build_app(config).await.unwrap();
+        let server = Arc::new(server::build(config).await.unwrap());
+        let app = server.router.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(axum::serve(listener, app.clone()).into_future());
-        Self { dir, db, app, addr }
+        Self {
+            server,
+            dir,
+            db,
+            app,
+            addr,
+        }
     }
 
     /// 주어진 토큰으로(없으면 비로그인으로) 요청을 보낸다. 본문이 있으면 JSON으로 보낸다.
@@ -259,4 +271,48 @@ pub async fn insert_broadcast(db: &TestDatabase, owner_id: Uuid, title: &str, en
     .unwrap();
     pool.close().await;
     id
+}
+
+/// 송출받던 인스턴스(`instance`)가 `heartbeat_ago` 전에 마지막으로 하트비트를 남긴 라이브 방송을
+/// DB에 직접 만든다. 송출받던 인스턴스가 죽은 상황을 재현할 때 쓴다. 시각은 DB 시계 기준이다.
+pub async fn insert_ingesting_broadcast(
+    db: &TestDatabase,
+    owner_id: Uuid,
+    title: &str,
+    instance: &str,
+    heartbeat_ago: std::time::Duration,
+) -> Uuid {
+    let id = Uuid::now_v7();
+    let pool = db.pool().await;
+    sqlx::query(
+        "INSERT INTO broadcasts (id, title, owner_id, created_at, ingest_instance, ingest_heartbeat_at) \
+         VALUES ($1, $2, $3, now() - make_interval(secs => $4), $5, now() - make_interval(secs => $4))",
+    )
+    .bind(id)
+    .bind(title)
+    .bind(owner_id)
+    .bind(heartbeat_ago.as_secs_f64())
+    .bind(instance)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    id
+}
+
+/// ffmpeg로 3초짜리 HLS 조각을 `dir`에 만든다. 송출받던 인스턴스가 남긴 라이브 조각을 재현한다.
+pub fn write_hls_fragments(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
+        .args(["-t", "3", "-c:v", "libx264", "-c:a", "aac"])
+        .args(["-f", "hls", "-hls_time", "1", "-hls_list_size", "0"])
+        .arg("-hls_segment_filename")
+        .arg(dir.join("seg%05d.ts"))
+        .arg(dir.join("index.m3u8"))
+        .status()
+        .expect("ffmpeg가 필요합니다");
+    assert!(status.success());
 }

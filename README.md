@@ -385,7 +385,10 @@ cargo run -p server
 | `STORAGE_QUOTA_BYTES` | `16106127360` (15GiB) | 저장된 녹화본 크기 합의 한도. 등록은 넘으면 507, 라이브는 닿으면 종료 |
 | `LIVE_DIR` | `data/live` | 라이브 HLS 조각을 만드는 임시 디렉터리. 녹화본을 만든 뒤 지운다 |
 | `FFMPEG_PATH` | `ffmpeg` | 송출을 HLS로 바꾸는 ffmpeg 실행 파일 |
-| `MAX_LIVE_BROADCASTS` | `2` | 동시에 진행할 수 있는 라이브 방송 수(송출마다 ffmpeg가 CPU로 인코딩) |
+| `MAX_LIVE_BROADCASTS` | `2` | 서비스 전체(모든 인스턴스 합)에서 동시에 진행할 수 있는 라이브 방송 수(송출마다 ffmpeg가 CPU로 인코딩) |
+| `INSTANCE_ID` | 호스트 이름 | 서버 인스턴스 이름. 컨테이너에서는 컨테이너 ID가 된다 |
+| `LIVE_HEARTBEAT_INTERVAL_SECS` | `5` | 송출 중인 인스턴스가 하트비트를 갱신하고, 끊긴 라이브를 찾는 주기 |
+| `LIVE_HEARTBEAT_TIMEOUT_SECS` | `30` | 하트비트가 이만큼 끊긴 라이브 방송은 송출받던 인스턴스가 죽은 것으로 보고 종료 |
 | `LIVE_IDLE_TIMEOUT_SECS` | `20` | 송출 중 영상이 이 시간 동안 오지 않으면 방송 종료 |
 | `JWT_SECRET` | (없음, 임시 키) | 로그인 토큰(JWT) 서명 키. 실제 값은 실행 환경에만 둔다. 예: `openssl rand -base64 48`로 만든 값. 비우면 시작할 때마다 임시 키를 만든다(재시작하면 모두 로그아웃) |
 | `JWT_TTL_SECS` | `86400` (24시간) | 로그인 토큰 유효 시간 |

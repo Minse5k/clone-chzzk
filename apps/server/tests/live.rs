@@ -78,6 +78,9 @@ impl LiveServer {
             live_dir: dir.path().join("live"),
             ffmpeg_path: "ffmpeg".into(),
             max_live_broadcasts: 2,
+            instance_id: "test-instance".into(),
+            live_heartbeat_interval: std::time::Duration::from_secs(5),
+            live_heartbeat_timeout: std::time::Duration::from_secs(30),
             live_idle_timeout: Duration::from_secs(20),
             jwt_secret: Some(TEST_JWT_SECRET.into()),
             jwt_ttl: std::time::Duration::from_secs(3600),
@@ -587,12 +590,13 @@ async fn 영상이_한동안_오지_않으면_서버가_방송을_종료한다()
 }
 
 #[tokio::test]
-async fn 서버가_송출_도중_멈췄다면_다시_시작할_때_방송을_종료하고_남은_영상을_녹화본으로_만든다() {
+async fn 송출하던_인스턴스가_멈춰_하트비트가_끊긴_방송은_서버가_시작할_때_종료하고_남은_영상을_녹화본으로_만든다()
+ {
     let dir = tempfile::tempdir().unwrap();
     let db = TestDatabase::create().await;
     let config = LiveServer::config(&dir, &db);
 
-    // 서버가 멈추기 전 상태: 라이브 중인 방송 둘. 하나는 HLS 조각이 남아 있고 하나는 없다.
+    // 서버가 멈추기 전 상태: 하트비트가 끊긴 라이브 중인 방송 둘. 하나는 HLS 조각이 남아 있고 하나는 없다.
     drop(server::build_app(config.clone()).await.unwrap());
     let pool = db.pool().await;
     let owner_id = Uuid::now_v7();
@@ -605,22 +609,25 @@ async fn 서버가_송출_도중_멈췄다면_다시_시작할_때_방송을_종
     .await
     .unwrap();
     pool.close().await;
-    let with_video = common::insert_broadcast(&db, owner_id, "조각이 남은 방송", false).await;
-    let without_video = common::insert_broadcast(&db, owner_id, "조각이 없는 방송", false).await;
+    let stopped_ago = Duration::from_secs(60 * 60);
+    let with_video = common::insert_ingesting_broadcast(
+        &db,
+        owner_id,
+        "조각이 남은 방송",
+        "dead-instance",
+        stopped_ago,
+    )
+    .await;
+    let without_video = common::insert_ingesting_broadcast(
+        &db,
+        owner_id,
+        "조각이 없는 방송",
+        "dead-instance",
+        stopped_ago,
+    )
+    .await;
     let live_dir = config.live_dir.join(with_video.to_string());
-    std::fs::create_dir_all(&live_dir).unwrap();
-    let status = std::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error"])
-        .args(["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30"])
-        .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
-        .args(["-t", "3", "-c:v", "libx264", "-c:a", "aac"])
-        .args(["-f", "hls", "-hls_time", "1", "-hls_list_size", "0"])
-        .arg("-hls_segment_filename")
-        .arg(live_dir.join("seg%05d.ts"))
-        .arg(live_dir.join("index.m3u8"))
-        .status()
-        .unwrap();
-    assert!(status.success());
+    common::write_hls_fragments(&live_dir);
 
     let server = LiveServer::serve(dir, db, config).await;
 

@@ -181,6 +181,12 @@ impl CommentHub {
         self.lock().remove(&broadcast_id);
     }
 
+    /// 이 인스턴스의 댓글 WebSocket 연결을 모두 닫는다. 인스턴스가 내려갈 때 쓴다.
+    /// 시청 화면은 잠시 뒤 다시 연결하며 다른 인스턴스로 붙는다.
+    pub(crate) fn close_all(&self) {
+        self.lock().clear();
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, broadcast::Sender<CommentEvent>>> {
         self.channels
             .lock()

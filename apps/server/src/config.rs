@@ -25,8 +25,15 @@ pub struct Config {
     pub live_dir: PathBuf,
     /// 송출을 HLS로 바꾸는 ffmpeg 실행 파일.
     pub ffmpeg_path: PathBuf,
-    /// 동시에 진행할 수 있는 라이브 방송 수. 송출마다 ffmpeg가 CPU로 인코딩하므로 VM에 맞춘다.
+    /// 서비스 전체(모든 인스턴스 합)에서 동시에 진행할 수 있는 라이브 방송 수.
+    /// 송출마다 ffmpeg가 CPU로 인코딩하므로 머신에 맞춘다.
     pub max_live_broadcasts: usize,
+    /// 이 서버 인스턴스의 이름. 라이브 방송을 어느 인스턴스가 송출받는지 기록할 때 쓴다.
+    pub instance_id: String,
+    /// 송출 중인 인스턴스가 하트비트를 갱신하고, 끊긴 라이브 방송을 찾는 주기.
+    pub live_heartbeat_interval: Duration,
+    /// 하트비트가 이만큼 끊긴 라이브 방송은 송출받던 인스턴스가 죽은 것으로 보고 종료한다.
+    pub live_heartbeat_timeout: Duration,
     /// 송출 중에 녹화 조각이 이 시간 동안 오지 않으면 방송을 종료한다.
     pub live_idle_timeout: Duration,
     /// 로그인 토큰(JWT)의 서명 키. 비우면 서버를 시작할 때마다 임시 키를 만든다(재시작하면 모두 로그아웃).
@@ -216,6 +223,15 @@ impl Config {
             live_dir: env_or("LIVE_DIR", "data/live").into(),
             ffmpeg_path: env_or("FFMPEG_PATH", "ffmpeg").into(),
             max_live_broadcasts: env_number("MAX_LIVE_BROADCASTS", 2)?,
+            instance_id: instance_id_from_env(),
+            live_heartbeat_interval: Duration::from_secs(env_number(
+                "LIVE_HEARTBEAT_INTERVAL_SECS",
+                5,
+            )?),
+            live_heartbeat_timeout: Duration::from_secs(env_number(
+                "LIVE_HEARTBEAT_TIMEOUT_SECS",
+                30,
+            )?),
             live_idle_timeout: Duration::from_secs(env_number("LIVE_IDLE_TIMEOUT_SECS", 20)?),
             jwt_secret: env::var("JWT_SECRET")
                 .ok()
@@ -226,6 +242,16 @@ impl Config {
             toss: TossConfig::from_env()?,
         })
     }
+}
+
+/// `INSTANCE_ID`, 없으면 호스트 이름(컨테이너에서는 컨테이너 ID), 그것도 없으면 무작위 이름.
+fn instance_id_from_env() -> String {
+    ["INSTANCE_ID", "HOSTNAME"]
+        .iter()
+        .filter_map(|key| env::var(key).ok())
+        .map(|value| value.trim().to_owned())
+        .find(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("instance-{}", uuid::Uuid::now_v7().simple()))
 }
 
 fn env_number<T: std::str::FromStr>(key: &str, default: T) -> anyhow::Result<T> {

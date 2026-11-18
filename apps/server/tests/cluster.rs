@@ -262,3 +262,179 @@ async fn 다른_인스턴스에서_라이브를_보고_종료해도_송출이_�
     .await;
     assert_eq!(recorded.status, BroadcastStatus::Ended);
 }
+
+#[tokio::test]
+async fn 새_인스턴스가_떠도_다른_인스턴스가_송출받는_라이브는_끝나지_않는다() {
+    let (a, _b) = TestApp::cluster(|_| {}).await;
+    let owner = a.signup("streamer").await;
+    let (mut socket, started) = start_broadcast(&a, &owner, "계속되는 방송").await;
+    send_video(&mut socket, &sample_webm(2)).await;
+
+    // 스케일 아웃으로 인스턴스 C가 새로 뜬다. 시작할 때 끊긴 라이브만 정리하고 이 방송은 그대로 둔다.
+    let c = a.peer(|_| {}).await;
+
+    assert_eq!(
+        broadcast(&c, started.id).await.status,
+        BroadcastStatus::Live
+    );
+    send(&mut socket, &IngestClientMessage::End).await;
+    assert_eq!(
+        receive(&mut socket).await,
+        IngestServerMessage::Ended { reason: None }
+    );
+}
+
+#[tokio::test]
+async fn 하트비트가_끊긴_라이브_방송은_다른_인스턴스가_종료하고_남은_영상을_녹화본으로_만든다() {
+    let short = |config: &mut server::Config| {
+        config.live_heartbeat_interval = Duration::from_millis(200);
+        config.live_heartbeat_timeout = Duration::from_secs(2);
+    };
+    let (a, b) = TestApp::cluster(short).await;
+    let owner = a.signup("streamer").await;
+    // 인스턴스 X가 송출받다가 방금 죽었다: 하트비트가 더 이상 갱신되지 않는다.
+    let id = common::insert_ingesting_broadcast(
+        &a.db,
+        owner.user.id,
+        "죽은 인스턴스의 방송",
+        "instance-x",
+        Duration::ZERO,
+    )
+    .await;
+    common::write_hls_fragments(&a.dir.path().join("live").join(id.to_string()));
+    assert_eq!(broadcast(&b, id).await.status, BroadcastStatus::Live);
+
+    let recorded = wait_for(&b, id, "녹화본 있음", |b| b.recording.is_some()).await;
+
+    assert_eq!(recorded.status, BroadcastStatus::Ended);
+    assert!(!a.dir.path().join("live").join(id.to_string()).exists());
+}
+
+#[tokio::test]
+async fn 송출받는_인스턴스는_하트비트를_갱신해_정리되지_않는다() {
+    let short = |config: &mut server::Config| {
+        config.live_heartbeat_interval = Duration::from_millis(200);
+        config.live_heartbeat_timeout = Duration::from_secs(2);
+    };
+    let (a, b) = TestApp::cluster(short).await;
+    let owner = a.signup("streamer").await;
+    // 영상은 미리 만든다(ffmpeg를 기다리는 동안 테스트 런타임이 서버 작업을 돌리지 못한다).
+    let video = sample_webm(4);
+    let (mut socket, started) = start_broadcast(&a, &owner, "오래 하는 방송").await;
+
+    // 정리 기준(2초)보다 오래 송출한다. 그동안 영상 조각을 계속 보낸다.
+    for chunk in video.chunks(video.len() / 16 + 1) {
+        if let Err(err) = socket.send(Message::Binary(chunk.to_vec().into())).await {
+            panic!("송출이 끊겼습니다({err}): {:?}", receive(&mut socket).await);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    assert_eq!(
+        broadcast(&b, started.id).await.status,
+        BroadcastStatus::Live
+    );
+    send(&mut socket, &IngestClientMessage::End).await;
+    assert_eq!(
+        receive(&mut socket).await,
+        IngestServerMessage::Ended { reason: None }
+    );
+}
+
+#[tokio::test]
+async fn 동시_라이브_방송_수는_모든_인스턴스를_합쳐_센다() {
+    let (a, b) = TestApp::cluster(|config| config.max_live_broadcasts = 1).await;
+    let first = a.signup("first").await;
+    let second = b.signup("second").await;
+    let (mut socket, _) = start_broadcast(&a, &first, "A의 방송").await;
+
+    let url = format!("ws://{}{LIVE_INGEST_PATH}", b.addr);
+    let mut rejected = tokio_tungstenite::connect_async(url).await.unwrap().0;
+    send(
+        &mut rejected,
+        &IngestClientMessage::Start {
+            token: Some(second.token.clone()),
+            title: "B의 방송".into(),
+            mime_type: "video/webm;codecs=vp8,opus".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        receive(&mut rejected).await,
+        IngestServerMessage::Error {
+            message: "지금은 동시에 진행할 수 있는 라이브 방송 수(1개)가 모두 차 있습니다. 잠시 후 다시 시도해 주세요."
+                .into()
+        }
+    );
+
+    // A의 방송이 끝나면 B로도 시작할 수 있다.
+    send(&mut socket, &IngestClientMessage::End).await;
+    receive(&mut socket).await;
+    let (mut next, _) = start_broadcast(&b, &second, "B의 방송").await;
+    send(&mut next, &IngestClientMessage::End).await;
+    receive(&mut next).await;
+}
+
+#[tokio::test]
+async fn 헬스_체크는_인스턴스와_송출_수를_알리고_내려가는_인스턴스는_송출을_끝내고_503으로_답한다()
+{
+    let (a, b) = TestApp::cluster(|config| {
+        config.instance_id = format!("instance-{}", Uuid::now_v7().simple());
+    })
+    .await;
+    let owner = a.signup("streamer").await;
+    let health = |app: &TestApp| {
+        let app = app.app.clone();
+        async move {
+            use tower::ServiceExt;
+            let response = app
+                .oneshot(
+                    axum::http::Request::get("/healthz")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            )
+        }
+    };
+    let (_, on_b) = health(&b).await;
+    let (_, on_a) = health(&a).await;
+    assert_ne!(on_a["instance"], on_b["instance"]);
+
+    let (mut socket, started) = start_broadcast(&a, &owner, "내려갈 인스턴스의 방송").await;
+    send_video(&mut socket, &sample_webm(4)).await;
+    wait_for(&b, started.id, "라이브 재생 가능", |b| {
+        b.live_playlist
+    })
+    .await;
+    let (status, body) = health(&a).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["live_ingests"], 1);
+    assert_eq!(body["shutting_down"], false);
+
+    // 스케일 인 등으로 A에 종료 신호가 왔다.
+    a.server.prepare_shutdown(Duration::from_secs(20)).await;
+
+    assert_eq!(
+        receive(&mut socket).await,
+        IngestServerMessage::Ended {
+            reason: Some("서버 점검으로 방송을 종료했습니다. 다시 송출을 시작해 주세요.".into())
+        }
+    );
+    let (status, body) = health(&a).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["live_ingests"], 0);
+    // 녹화본까지 만든 뒤에 내려가고, 다른 인스턴스에서 그대로 보인다.
+    let ended = broadcast(&b, started.id).await;
+    assert_eq!(ended.status, BroadcastStatus::Ended);
+    assert!(ended.recording.is_some());
+}

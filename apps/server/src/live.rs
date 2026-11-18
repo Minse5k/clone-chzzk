@@ -5,7 +5,10 @@ use std::{
     collections::HashMap,
     path::{Path as FsPath, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -26,7 +29,7 @@ use shared::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::{OwnedSemaphorePermit, Semaphore, oneshot},
+    sync::oneshot,
 };
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -56,10 +59,12 @@ async fn run_ingest(state: AppState, mut socket: WebSocket) {
         Ok(started) => started,
         Err(message) => return reject(socket, message).await,
     };
-    let (slot, limit) = match admit(&state).await {
-        Ok(admitted) => admitted,
+    let limit = match admit(&state).await {
+        Ok(limit) => limit,
         Err(message) => return reject(socket, message).await,
     };
+    // 녹화본을 다 만들 때까지 이 인스턴스가 송출을 맡고 있음을 센다(정상 종료·스케일 인 판단용).
+    let _busy = state.live.track();
 
     let id = Uuid::now_v7();
     let dir = live_dir(&state, id);
@@ -76,17 +81,33 @@ async fn run_ingest(state: AppState, mut socket: WebSocket) {
         }
     };
     let started_at = Utc::now();
-    if let Err(err) = db::insert_live_broadcast(&state.db, id, &title, owner.id, started_at).await {
-        tracing::error!(broadcast = %id, "라이브 방송을 기록할 수 없습니다: {err:#}");
+    let max_live = state.config.max_live_broadcasts;
+    let inserted = db::insert_live_broadcast(
+        &state.db,
+        id,
+        &title,
+        owner.id,
+        started_at,
+        &state.config.instance_id,
+        max_live,
+    )
+    .await;
+    let rejection = match inserted {
+        Ok(true) => None,
+        Ok(false) => Some(format!(
+            "지금은 동시에 진행할 수 있는 라이브 방송 수({max_live}개)가 모두 차 있습니다. 잠시 후 다시 시도해 주세요."
+        )),
+        Err(err) => {
+            tracing::error!(broadcast = %id, "라이브 방송을 기록할 수 없습니다: {err:#}");
+            Some("송출을 시작할 수 없습니다. 잠시 후 다시 시도해 주세요.".into())
+        }
+    };
+    if let Some(message) = rejection {
         encoder.finish().await;
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        return reject(
-            socket,
-            "송출을 시작할 수 없습니다. 잠시 후 다시 시도해 주세요.",
-        )
-        .await;
+        return reject(socket, message).await;
     }
-    tracing::info!(broadcast = %id, "송출 시작: {title}");
+    tracing::info!(broadcast = %id, instance = %state.config.instance_id, "송출 시작: {title}");
     let (registration, mut stop) = state.live.register(id);
 
     let broadcast = Broadcast {
@@ -101,14 +122,11 @@ async fn run_ingest(state: AppState, mut socket: WebSocket) {
     };
     send(&mut socket, &IngestServerMessage::Started { broadcast }).await;
 
-    let reason = relay(
-        &mut socket,
-        &mut encoder,
-        &mut stop,
-        limit,
-        state.config.live_idle_timeout,
-    )
-    .await;
+    // 송출하는 동안 하트비트를 갱신해, 다른 인스턴스가 이 방송을 끊긴 것으로 정리하지 않게 한다.
+    // ffmpeg가 입력을 늦게 읽어 조각 전달이 멈춰도 하트비트는 멈추지 않도록 따로 돈다.
+    let heartbeat = tokio::spawn(keep_alive(state.clone(), id));
+    let reason = relay(&state, &mut socket, &mut encoder, &mut stop, limit).await;
+    heartbeat.abort();
     drop(registration);
 
     // 상태를 먼저 종료로 바꿔, 마무리하는 동안에도 시청자가 라이브로 착각하지 않게 한다.
@@ -116,8 +134,6 @@ async fn run_ingest(state: AppState, mut socket: WebSocket) {
         tracing::error!(broadcast = %id, "방송을 종료로 기록할 수 없습니다: {err:#}");
     }
     encoder.finish().await;
-    // 인코딩이 끝났으니 동시 라이브 자리를 돌려준다. 송출자가 종료 응답을 받으면 바로 다시 시작할 수 있다.
-    drop(slot);
     tracing::info!(broadcast = %id, "송출 종료");
 
     send(&mut socket, &IngestServerMessage::Ended { reason }).await;
@@ -204,53 +220,23 @@ async fn make_recording(state: &AppState, id: Uuid, dir: &FsPath) -> anyhow::Res
     }
 }
 
-/// 송출을 받을 수 있는 서버 상태. 서버를 시작할 때 한 번 확인한다.
+/// 이 인스턴스가 송출을 받을 수 있는지와, 지금 받고 있는 송출들.
 pub struct LiveCapacity {
     ffmpeg_available: bool,
-    max_live_broadcasts: usize,
-    slots: Arc<Semaphore>,
-    /// 진행 중인 송출 연결에 종료를 알리는 신호. 소유자가 다른 기기에서 방송을 끝낼 때 쓴다.
-    stops: Mutex<HashMap<Uuid, oneshot::Sender<()>>>,
+    /// 진행 중인 송출 연결에 종료를 알리는 신호(송출자에게 보여 줄 이유). 소유자가 다른 기기에서
+    /// 방송을 끝내거나 인스턴스가 내려갈 때 쓴다.
+    stops: Mutex<HashMap<Uuid, oneshot::Sender<String>>>,
+    /// 받아들인 뒤 녹화본까지 다 만들지 않은 송출 수.
+    busy: AtomicUsize,
+    /// 종료 신호를 받아 내려가는 중이면 새 송출을 받지 않는다.
+    shutting_down: AtomicBool,
 }
 
 /// 소유자가 다른 기기에서 방송을 끝냈을 때 송출자에게 보여 주는 이유.
 pub const STOPPED_BY_OWNER: &str = "소유자가 다른 기기에서 방송을 종료했습니다.";
-
-impl LiveCapacity {
-    /// 진행 중인 송출 연결에 종료를 알린다. 그 방송을 송출하는 연결이 없으면 `false`.
-    pub fn request_stop(&self, id: Uuid) -> bool {
-        let sender = self.stops.lock().expect("송출 종료 신호 잠금").remove(&id);
-        sender.is_some_and(|sender| sender.send(()).is_ok())
-    }
-
-    /// 송출 연결을 종료 신호 대상으로 등록한다. 돌려준 값이 사라지면 등록이 풀린다.
-    fn register(self: &Arc<Self>, id: Uuid) -> (StopRegistration, oneshot::Receiver<()>) {
-        let (sender, receiver) = oneshot::channel();
-        self.stops
-            .lock()
-            .expect("송출 종료 신호 잠금")
-            .insert(id, sender);
-        let registration = StopRegistration {
-            live: Arc::clone(self),
-            id,
-        };
-        (registration, receiver)
-    }
-}
-
-/// 송출이 끝나면 종료 신호 등록을 푼다.
-struct StopRegistration {
-    live: Arc<LiveCapacity>,
-    id: Uuid,
-}
-
-impl Drop for StopRegistration {
-    fn drop(&mut self) {
-        if let Ok(mut stops) = self.live.stops.lock() {
-            stops.remove(&self.id);
-        }
-    }
-}
+/// 송출을 받던 서버 인스턴스가 내려갈 때 송출자에게 보여 주는 이유.
+pub const STOPPED_BY_SHUTDOWN: &str =
+    "서버 점검으로 방송을 종료했습니다. 다시 송출을 시작해 주세요.";
 
 impl LiveCapacity {
     /// ffmpeg를 실행할 수 있는지 확인한다. 없어도 서버는 시작하고 송출만 거부한다.
@@ -271,10 +257,92 @@ impl LiveCapacity {
         }
         Self {
             ffmpeg_available,
-            max_live_broadcasts: config.max_live_broadcasts,
-            slots: Arc::new(Semaphore::new(config.max_live_broadcasts)),
             stops: Mutex::default(),
+            busy: AtomicUsize::new(0),
+            shutting_down: AtomicBool::new(false),
         }
+    }
+
+    /// 이 인스턴스의 송출 연결에 종료를 알린다. 이 인스턴스가 그 방송을 송출받고 있지 않으면 `false`.
+    pub fn request_stop(&self, id: Uuid) -> bool {
+        let sender = self.lock().remove(&id);
+        sender.is_some_and(|sender| sender.send(STOPPED_BY_OWNER.into()).is_ok())
+    }
+
+    /// 이 인스턴스가 받는 송출 중 녹화본까지 다 만들지 않은 것의 수.
+    pub fn busy_ingests(&self) -> usize {
+        self.busy.load(Ordering::SeqCst)
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    /// 인스턴스가 내려간다. 새 송출을 받지 않고, 진행 중인 송출은 이유와 함께 끝낸다.
+    /// 끝낸 송출 수를 돌려준다. 송출들은 평소처럼 녹화본을 만든다.
+    pub fn shut_down(&self) -> usize {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let stops: Vec<_> = self.lock().drain().collect();
+        let count = stops.len();
+        for (_, sender) in stops {
+            let _ = sender.send(STOPPED_BY_SHUTDOWN.into());
+        }
+        count
+    }
+
+    /// 진행 중인 송출이 모두 녹화본까지 끝나기를 기다린다. 시간 안에 끝나면 `true`.
+    pub async fn wait_idle(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            while self.busy_ingests() > 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// 송출 하나를 맡았음을 센다. 돌려준 값이 사라지면 끝난 것으로 본다.
+    fn track(self: &Arc<Self>) -> BusyIngest {
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        BusyIngest(Arc::clone(self))
+    }
+
+    /// 송출 연결을 종료 신호 대상으로 등록한다. 돌려준 값이 사라지면 등록이 풀린다.
+    fn register(self: &Arc<Self>, id: Uuid) -> (StopRegistration, oneshot::Receiver<String>) {
+        let (sender, receiver) = oneshot::channel();
+        self.lock().insert(id, sender);
+        let registration = StopRegistration {
+            live: Arc::clone(self),
+            id,
+        };
+        (registration, receiver)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, oneshot::Sender<String>>> {
+        self.stops
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// 맡은 송출이 녹화본까지 끝나면 수를 줄인다.
+struct BusyIngest(Arc<LiveCapacity>);
+
+impl Drop for BusyIngest {
+    fn drop(&mut self) {
+        self.0.busy.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// 송출이 끝나면 종료 신호 등록을 푼다.
+struct StopRegistration {
+    live: Arc<LiveCapacity>,
+    id: Uuid,
+}
+
+impl Drop for StopRegistration {
+    fn drop(&mut self) {
+        self.live.lock().remove(&self.id);
     }
 }
 
@@ -299,9 +367,13 @@ impl ReceiveLimit {
     }
 }
 
-/// 송출을 시작해도 되는지 확인한다. 받아들이면 동시 라이브 자리 하나와 받을 수 있는 크기를 돌려준다.
-async fn admit(state: &AppState) -> Result<(OwnedSemaphorePermit, ReceiveLimit), String> {
+/// 송출을 시작해도 되는지 확인한다. 받아들이면 받을 수 있는 크기를 돌려준다.
+/// 서비스 전체의 동시 라이브 수는 방송을 기록할 때 DB에서 확인한다.
+async fn admit(state: &AppState) -> Result<ReceiveLimit, String> {
     let live = &state.live;
+    if live.is_shutting_down() {
+        return Err("서버 점검 중입니다. 잠시 후 다시 시도해 주세요.".into());
+    }
     if !live.ffmpeg_available {
         return Err(
             "서버에 ffmpeg가 없어 라이브 송출을 할 수 없습니다. 녹화방송 등록과 시청은 그대로 쓸 수 있습니다."
@@ -316,28 +388,34 @@ async fn admit(state: &AppState) -> Result<(OwnedSemaphorePermit, ReceiveLimit),
     if remaining == 0 {
         return Err("저장 공간 한도에 도달해 더 이상 방송을 시작할 수 없습니다.".into());
     }
-    let slot = live.slots.clone().try_acquire_owned().map_err(|_| {
-        format!(
-            "지금은 동시에 진행할 수 있는 라이브 방송 수({}개)가 모두 차 있습니다. 잠시 후 다시 시도해 주세요.",
-            live.max_live_broadcasts
-        )
-    })?;
-    let limit = ReceiveLimit {
+    Ok(ReceiveLimit {
         max_bytes: state.config.max_upload_bytes.min(remaining),
         by_quota: remaining < state.config.max_upload_bytes,
-    };
-    Ok((slot, limit))
+    })
 }
 
-/// 서버가 송출 도중에 멈춰 라이브 중으로 남은 방송을 종료하고, 남은 조각이 있으면 녹화본으로 만든다.
-pub async fn recover(state: &AppState) -> anyhow::Result<()> {
-    let leftovers = db::list_broadcasts(&state.db, Some(BroadcastStatus::Live)).await?;
-    for broadcast in leftovers {
-        tracing::warn!(broadcast = %broadcast.id, "서버 재시작 전의 라이브 방송을 종료합니다");
-        db::end_broadcast(&state.db, broadcast.id, Utc::now()).await?;
-        save_recording(state, broadcast.id).await;
+/// 송출받던 인스턴스가 죽어 하트비트가 끊긴 라이브 방송을 종료하고, 공유 볼륨에 남은 조각이 있으면
+/// 녹화본으로 만든다. 여러 인스턴스가 함께 돌려도 방송 하나는 한 인스턴스만 정리한다.
+/// 하트비트가 살아 있는 방송(다른 인스턴스가 송출받는 중)은 건드리지 않는다.
+pub async fn sweep_stale(state: &AppState) -> anyhow::Result<()> {
+    let stale =
+        db::end_stale_live_broadcasts(&state.db, state.config.live_heartbeat_timeout).await?;
+    for id in stale {
+        tracing::warn!(broadcast = %id, "송출하던 인스턴스의 하트비트가 끊겨 라이브 방송을 종료합니다");
+        save_recording(state, id).await;
     }
     Ok(())
+}
+
+/// 하트비트가 끊긴 라이브 방송을 주기적으로 정리한다.
+pub async fn run_sweeper(state: AppState) {
+    let mut ticks = tokio::time::interval(state.config.live_heartbeat_interval);
+    loop {
+        ticks.tick().await;
+        if let Err(err) = sweep_stale(&state).await {
+            tracing::warn!("끊긴 라이브 방송을 정리하지 못했습니다: {err:#}");
+        }
+    }
 }
 
 /// 첫 메시지로 송출 시작을 받아 검증한 제목과 송출한 사용자(소유자)를 돌려준다.
@@ -370,27 +448,51 @@ async fn receive_start(state: &AppState, socket: &mut WebSocket) -> Result<(Stri
     }
 }
 
+/// 송출 중인 방송의 하트비트를 주기적으로 갱신한다. 종료 신호를 놓쳤어도 DB에서 방송이 이미
+/// 종료되었으면(다른 인스턴스에서 소유자가 끝냄) 송출을 끝내게 한다.
+async fn keep_alive(state: AppState, id: Uuid) {
+    let mut ticks = tokio::time::interval(state.config.live_heartbeat_interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        match db::touch_ingest(&state.db, id, &state.config.instance_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                state.live.request_stop(id);
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(broadcast = %id, "하트비트를 기록하지 못했습니다: {err:#}");
+            }
+        }
+    }
+}
+
 /// 녹화 조각을 ffmpeg로 흘려 넣는다. 송출자가 끝내거나 연결이 끊기면 `None`,
 /// 서버 사정으로 끝내야 하면 송출자에게 보여 줄 이유를 돌려준다.
 async fn relay(
+    state: &AppState,
     socket: &mut WebSocket,
     encoder: &mut HlsEncoder,
-    stop: &mut oneshot::Receiver<()>,
+    stop: &mut oneshot::Receiver<String>,
     limit: ReceiveLimit,
-    idle_timeout: Duration,
 ) -> Option<String> {
+    let idle_timeout = state.config.live_idle_timeout;
+    let mut idle = Box::pin(tokio::time::sleep(idle_timeout));
     let mut received: u64 = 0;
     loop {
         let message = tokio::select! {
-            message = tokio::time::timeout(idle_timeout, socket.recv()) => message,
-            Ok(()) = &mut *stop => return Some(STOPPED_BY_OWNER.into()),
+            message = socket.recv() => message,
+            Ok(reason) = &mut *stop => return Some(reason),
+            () = &mut idle => {
+                return Some(format!(
+                    "{}초 동안 영상이 오지 않아 방송을 종료했습니다.",
+                    idle_timeout.as_secs()
+                ));
+            }
         };
-        let Ok(message) = message else {
-            return Some(format!(
-                "{}초 동안 영상이 오지 않아 방송을 종료했습니다.",
-                idle_timeout.as_secs()
-            ));
-        };
+        idle.as_mut()
+            .reset(tokio::time::Instant::now() + idle_timeout);
         match message {
             Some(Ok(Message::Binary(chunk))) => {
                 received += chunk.len() as u64;

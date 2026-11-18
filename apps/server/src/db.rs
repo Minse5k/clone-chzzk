@@ -13,6 +13,8 @@ pub type Db = PgPool;
 
 /// 저장 총량을 확인하고 녹화본을 기록하는 트랜잭션끼리 줄을 세우는 advisory lock 키.
 const QUOTA_LOCK: i64 = 0x6368_7a7a_6b01;
+/// 라이브 방송 수를 세고 새 라이브를 기록하는 트랜잭션끼리 줄을 세우는 advisory lock 키.
+const LIVE_LOCK: i64 = 0x6368_7a7a_6b02;
 
 /// DB에 연결하고 마이그레이션을 적용한다. 여러 인스턴스가 동시에 시작해도
 /// 마이그레이터가 잠금을 잡아 한 번만 적용된다.
@@ -251,21 +253,69 @@ async fn insert_recording_row(
 }
 
 /// 송출을 시작한 라이브 방송을 기록한다. 종료 시각이 없으므로 라이브 중이다.
+/// 서비스 전체의 라이브 방송이 이미 `max_live`개면 기록하지 않고 `Ok(false)`를 돌려준다.
+/// 여러 인스턴스가 동시에 시작해도 advisory lock으로 줄을 세워 한도를 넘지 않는다.
 pub async fn insert_live_broadcast(
     pool: &Db,
     id: Uuid,
     title: &str,
     owner_id: Uuid,
     started_at: DateTime<Utc>,
-) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO broadcasts (id, title, owner_id, created_at) VALUES ($1, $2, $3, $4)")
-        .bind(id)
-        .bind(title)
-        .bind(owner_id)
-        .bind(started_at)
-        .execute(pool)
+    instance: &str,
+    max_live: usize,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(LIVE_LOCK)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM broadcasts WHERE ended_at IS NULL")
+        .fetch_one(&mut *tx)
+        .await?;
+    if usize::try_from(live)? >= max_live {
+        return Ok(false);
+    }
+    sqlx::query(
+        "INSERT INTO broadcasts (id, title, owner_id, created_at, ingest_instance, ingest_heartbeat_at) \
+         VALUES ($1, $2, $3, $4, $5, now())",
+    )
+    .bind(id)
+    .bind(title)
+    .bind(owner_id)
+    .bind(started_at)
+    .bind(instance)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// 송출 중인 인스턴스가 살아 있음을 기록한다. 방송이 이미 종료되었으면(다른 인스턴스에서 소유자가
+/// 끝냈거나, 하트비트가 끊겨 정리되었으면) `Ok(false)`.
+pub async fn touch_ingest(pool: &Db, id: Uuid, instance: &str) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        "UPDATE broadcasts SET ingest_heartbeat_at = now(), ingest_instance = $2 \
+         WHERE id = $1 AND ended_at IS NULL",
+    )
+    .bind(id)
+    .bind(instance)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// 하트비트가 `timeout`보다 오래 끊긴 라이브 방송을 종료하고 그 ID를 돌려준다.
+/// 조건부 갱신이라 여러 인스턴스가 함께 찾아도 방송 하나는 한 인스턴스만 종료시킨다.
+/// 하트비트 기록과 비교 모두 DB의 시계(`now()`)를 써서 인스턴스마다 시계가 달라도 어긋나지 않는다.
+pub async fn end_stale_live_broadcasts(pool: &Db, timeout: Duration) -> anyhow::Result<Vec<Uuid>> {
+    Ok(sqlx::query_scalar(
+        "UPDATE broadcasts SET ended_at = now() \
+         WHERE ended_at IS NULL AND ingest_heartbeat_at < now() - make_interval(secs => $1) \
+         RETURNING id",
+    )
+    .bind(timeout.as_secs_f64())
+    .fetch_all(pool)
+    .await?)
 }
 
 /// 라이브 방송을 종료한다. 이미 종료된 방송이면 그대로 둔다.
