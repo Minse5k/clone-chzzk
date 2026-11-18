@@ -73,7 +73,7 @@ Cargo workspace 모노레포.
 
 | 경로 | 설명 |
 |---|---|
-| `apps/server` | axum API 서버. SQLite(sqlx)에 사용자·방송·댓글을 저장한다. `src/auth.rs`가 회원가입·로그인·로그아웃과 토큰 검증(`AuthUser`), `src/api.rs`가 방송 API와 소유자 권한 확인(`find_owned`), `src/comments.rs`가 댓글 API와 방송 알림 WebSocket, `src/donations.rs`가 후원 주문·승인 확인·실패 통지·웹훅·내역, `src/payments.rs`가 토스페이먼츠 결제 승인·조회 API, `src/live.rs`가 송출 WebSocket·ffmpeg HLS 변환·라이브 재생·종료 후 녹화본을 맡는다. |
+| `apps/server` | axum API 서버. PostgreSQL(sqlx)에 사용자·방송·댓글·후원을 저장한다. `src/auth.rs`가 회원가입·로그인·로그아웃과 토큰 검증(`AuthUser`), `src/api.rs`가 방송 API와 소유자 권한 확인(`find_owned`), `src/comments.rs`가 댓글 API와 방송 알림 WebSocket, `src/donations.rs`가 후원 주문·승인 확인·실패 통지·웹훅·내역, `src/payments.rs`가 토스페이먼츠 결제 승인·조회 API, `src/live.rs`가 송출 WebSocket·ffmpeg HLS 변환·라이브 재생·종료 후 녹화본을 맡는다. |
 | `apps/web` | Dioxus 0.7 웹 앱. 방송 목록·상세(녹화본/라이브 플레이어, 소유자 관리, 댓글)·등록·라이브 송출·로그인·회원가입 화면. `src/session.rs`가 로그인 상태, `src/comments.rs`가 댓글 영역과 실시간 연결, `src/donations.rs`가 후원 폼·토스페이먼츠 결제위젯·결제 결과 화면·후원 내역, `src/live.rs`가 카메라·마이크와 송출을 맡는다. |
 | `crates/shared` | 서버와 웹이 함께 쓰는 API 타입, 송출·댓글 WebSocket 메시지. |
 
@@ -86,19 +86,27 @@ Cargo workspace 모노레포.
 
 ## 로컬 실행
 
-터미널 두 개를 쓴다. 기본값만으로 실행되며 비밀 값은 필요 없다.
+PostgreSQL 하나와 터미널 두 개를 쓴다. 아래 개발용 DB 비밀번호(`postgres`)는 로컬에서만 쓰는 값이다.
+
+```bash
+# 개발·테스트용 PostgreSQL (한 번만)
+docker run -d --name chzzk-dev-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17
+```
 
 ```bash
 # 터미널 1: API 서버 (http://localhost:3000)
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
 cargo run -p server
 ```
+
+아래의 `cargo run -p server` 예시는 모두 터미널 1에서 이렇게 `DATABASE_URL`을 내보낸 상태를 가정한다.
 
 ```bash
 # 터미널 2: 웹 (http://localhost:8080)
 dx serve -p web
 ```
 
-브라우저에서 http://localhost:8080 을 연다. 데이터는 기본적으로 `data/` 아래(SQLite 파일, 녹화본, 라이브 HLS 조각)에 저장된다. 이 상태에서 같은 PC의 브라우저는 웹캠으로 송출할 수 있다(localhost는 브라우저가 보안 출처로 취급한다).
+브라우저에서 http://localhost:8080 을 연다. DB는 PostgreSQL에, 녹화본과 라이브 HLS 조각은 기본적으로 `data/` 아래에 저장된다. 이 상태에서 같은 PC의 브라우저는 웹캠으로 송출할 수 있다(localhost는 브라우저가 보안 출처로 취급한다).
 
 `JWT_SECRET`을 정하지 않으면 서버가 시작할 때마다 임시 서명 키를 만든다(로그에 경고가 나온다). 이 경우 서버를 다시 켜면 모든 사용자가 로그아웃되므로 다시 로그인하면 된다. 로그인을 유지하려면 직접 만든 값을 지정한다.
 
@@ -363,7 +371,8 @@ cargo run -p server
 | 이름 | 기본값 | 설명 |
 |---|---|---|
 | `SERVER_ADDR` | `0.0.0.0:3000` | 서버 바인딩 주소 |
-| `DATABASE_PATH` | `data/chzzk.db` | SQLite 파일 경로 |
+| `DATABASE_URL` | — (필수) | PostgreSQL 연결 주소. 예: `postgres://postgres:postgres@localhost:5432/postgres` |
+| `DATABASE_MAX_CONNECTIONS` | `10` | 인스턴스 하나가 여는 DB 연결 수의 상한 |
 | `STORAGE_BACKEND` | `local` | 녹화본 저장소. `local` 또는 `oci` |
 | `STORAGE_DIR` | `data/recordings` | local 저장소 디렉터리 |
 | `OCI_S3_ENDPOINT` | — | (oci) S3 호환 엔드포인트 `https://<namespace>.compat.objectstorage.<region>.oraclecloud.com` |
@@ -488,14 +497,18 @@ docker compose up -d --build
 ## 테스트
 
 ```bash
+# 테스트용 PostgreSQL (로컬 실행의 chzzk-dev-pg를 그대로 써도 된다)
+docker run -d --name chzzk-test-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17
 cargo test -p server
 ```
 
-서버 통합 테스트 97개와 단위 테스트 1개. 테스트마다 임시 SQLite 파일, 임시 저장소, 임시 라이브 디렉터리를 쓰며, 테스트용 서명 키(`test-only-jwt-secret`)와 결제 키(`test_sk_fake_…`)는 실제 비밀 값이 아니다. 송출 테스트는 ffmpeg가 필요하다.
+테스트는 `TEST_DATABASE_URL`(기본 `postgres://postgres:postgres@localhost:5432/postgres`)의 PostgreSQL 서버에 테스트마다 새 데이터베이스를 만들고 끝나면 지운다.
+
+서버 통합 테스트 96개와 단위 테스트 1개. 테스트마다 새 DB, 임시 저장소, 임시 라이브 디렉터리를 쓰며, 테스트용 서명 키(`test-only-jwt-secret`)와 결제 키(`test_sk_fake_…`)는 실제 비밀 값이 아니다. 송출 테스트는 ffmpeg가 필요하다.
 
 - `tests/donations.rs`(29개): 토스페이먼츠 대신 같은 응답 형식의 **가짜 결제 서버**를 실제 포트에 띄운다(승인 요청 수, 시크릿 키 Basic 인증까지 확인). 주문 거절(401·400·409·404·503)과 받는 사람, 승인 성공, 같은 승인 확인 재요청·동시 요청이 한 건, 금액 조작은 승인 API를 부르지 않고 실패, 승인 거절·응답 금액 불일치·다른 주문의 결제 키 거절, 남의 주문 403, 실패·취소 통지, 확정된 후원은 실패로 바뀌지 않음, 결제 중 방송 종료는 승인 안 함, 웹훅만으로 확정·같은 웹훅 반복·승인 확인↔웹훅 순서 무관 한 건, 꾸민 웹훅 본문 무시, 실패·만료·취소 웹훅, 모르는 결제·다른 이벤트 무시, 결제 서비스 장애 시 502, 내역·합계(확정만, 최신순), 끝난 방송의 내역, 실시간 알림 한 번, 후원받은 방송 삭제 409
 - `tests/auth.rs`(9개): 회원가입·로그인·로그아웃, 잘못·만료·폐기된 토큰 401, 임시 서명 키
-- `tests/api.rs`(31개): 과제 1·2 등록·목록·상세·재생·거부·재시작·웹 서빙·상태, 소유자 권한 표(401·403·허용), 삭제·종료 409, 과제 2 DB의 마이그레이션
+- `tests/api.rs`(30개): 과제 1·2 등록·목록·상세·재생·거부·재시작·웹 서빙·상태, 소유자 권한 표(401·403·허용), 삭제·종료 409
 - `tests/comments.rs`(11개): 댓글 작성·목록·삭제 권한, 댓글 WebSocket 알림
 - `tests/live.rs`(17개): 실제 포트에서 ffmpeg webm을 WebSocket으로 송출 → HLS → 종료 → 녹화본, 시작 거부, 소유자 원격 종료, 재시작 복구
 

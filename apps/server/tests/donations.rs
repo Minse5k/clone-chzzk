@@ -351,7 +351,7 @@ impl DonationFixture {
     /// 주문의 현재 상태(DB 값).
     async fn status(&self, order_id: &str) -> String {
         let pool = self.app.pool().await;
-        let status = sqlx::query_scalar("SELECT status FROM donations WHERE order_id = ?")
+        let status = sqlx::query_scalar("SELECT status FROM donations WHERE order_id = $1")
             .bind(order_id)
             .fetch_one(&pool)
             .await
@@ -364,7 +364,7 @@ impl DonationFixture {
     async fn confirmed_total(&self) -> (i64, i64) {
         let pool = self.app.pool().await;
         let total = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM donations WHERE status = 'confirmed'",
+            "SELECT COUNT(*), COALESCE(SUM(amount), 0)::BIGINT FROM donations WHERE status = 'confirmed'",
         )
         .fetch_one(&pool)
         .await

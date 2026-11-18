@@ -1,9 +1,27 @@
-# 배포용 구성: 앱(서버 + 웹) 컨테이너와 그 앞의 Caddy 리버스 프록시.
+# 배포용 구성: PostgreSQL, 앱(서버 + 웹) 컨테이너와 그 앞의 Caddy 리버스 프록시.
 # 비밀 값은 저장소에 없는 .env 파일로만 넣는다(.env.example 참고).
 services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: chzzk
+      POSTGRES_DB: chzzk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?.env에 POSTGRES_PASSWORD를 정하세요}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chzzk -d chzzk"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
   app:
     build: .
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     env_file:
       - path: .env
         required: false
@@ -11,7 +29,7 @@ services:
     environment:
       SERVER_ADDR: 0.0.0.0:3000
       WEB_DIST_DIR: /app/web
-      DATABASE_PATH: /data/chzzk.db
+      DATABASE_URL: postgres://chzzk:${POSTGRES_PASSWORD}@postgres:5432/chzzk
       STORAGE_DIR: /data/recordings
       LIVE_DIR: /data/live
       FFMPEG_PATH: ffmpeg
@@ -39,6 +57,7 @@ services:
       - caddy-config:/config
 
 volumes:
-  app-data: # SQLite 파일, local 저장소 녹화본, 라이브 HLS 조각
+  postgres-data: # DB
+  app-data: # local 저장소 녹화본, 라이브 HLS 조각
   caddy-data:
   caddy-config:

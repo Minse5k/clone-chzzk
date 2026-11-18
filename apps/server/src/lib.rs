@@ -15,7 +15,6 @@ use std::{path::Path, sync::Arc};
 
 use anyhow::Context;
 use axum::{Router, http::HeaderValue};
-use sqlx::SqlitePool;
 use storage::RecordingStore;
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
@@ -24,12 +23,13 @@ use tower_http::{
 };
 
 pub use config::{
-    Config, JwtSecret, OciStorageConfig, StorageConfig, TossConfig, server_addr_from_env,
+    Config, DatabaseUrl, JwtSecret, OciStorageConfig, StorageConfig, TossConfig,
+    server_addr_from_env,
 };
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: SqlitePool,
+    pub db: db::Db,
     pub store: Arc<RecordingStore>,
     pub config: Arc<Config>,
     pub live: Arc<live::LiveCapacity>,
@@ -43,7 +43,7 @@ pub struct AppState {
 /// 같은 설정으로 다시 부르면 기존 데이터를 그대로 이어서 쓴다.
 pub async fn build_app(config: Config) -> anyhow::Result<Router> {
     let store = RecordingStore::open(&config.storage).await?;
-    let db = db::connect(&config.database_path).await?;
+    let db = db::connect(&config.database_url.0, config.database_max_connections).await?;
     let cors = cors_layer(&config.cors_allowed_origins)?;
     let web = match &config.web_dist_dir {
         Some(dir) => Some(web_service(dir)?),

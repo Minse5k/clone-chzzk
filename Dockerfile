@@ -38,7 +38,6 @@ COPY --from=build /out/web /app/web
 
 ENV SERVER_ADDR=0.0.0.0:3000 \
     WEB_DIST_DIR=/app/web \
-    DATABASE_PATH=/data/chzzk.db \
     STORAGE_DIR=/data/recordings \
     LIVE_DIR=/data/live \
     RUST_LOG=info,tower_http=info

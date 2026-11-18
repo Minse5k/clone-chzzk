@@ -12,13 +12,16 @@ use shared::{
     broadcast_end_path, broadcasts_path, recording_path,
 };
 use tempfile::TempDir;
-
-const TEST_JWT_SECRET: &str = "test-only-jwt-secret";
 use tower::ServiceExt;
 
-/// 테스트마다 임시 SQLite 파일과 임시 local 저장소를 쓰는 서버.
+mod common;
+
+use common::{TEST_JWT_SECRET, TestDatabase};
+
+/// 테스트마다 새 DB와 임시 local 저장소를 쓰는 서버.
 struct TestServer {
     dir: TempDir,
+    db: TestDatabase,
     limits: Limits,
     app: Router,
     /// 기본 사용자(방송 소유자). 테스트를 시작할 때 가입한다.
@@ -81,14 +84,18 @@ impl TestServer {
 
     async fn with_limits(limits: Limits) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let app = server::build_app(Self::config(&dir, limits)).await.unwrap();
-        Self::with_app(dir, limits, app).await
+        let db = TestDatabase::create().await;
+        let app = server::build_app(Self::config(&dir, &db, limits))
+            .await
+            .unwrap();
+        Self::with_app(dir, db, limits, app).await
     }
 
     /// 띄운 서버에 기본 사용자를 가입시킨다.
-    async fn with_app(dir: TempDir, limits: Limits, app: Router) -> Self {
+    async fn with_app(dir: TempDir, db: TestDatabase, limits: Limits, app: Router) -> Self {
         let mut server = Self {
             dir,
+            db,
             limits,
             app,
             owner: AuthResponse {
@@ -103,18 +110,22 @@ impl TestServer {
         server
     }
 
-    /// 같은 DB 파일과 저장소로 서버를 다시 띄운다. 기본 사용자와 토큰은 그대로 쓴다.
+    /// 같은 DB와 저장소로 서버를 다시 띄운다. 기본 사용자와 토큰은 그대로 쓴다.
     async fn restart(self) -> Self {
         let Self {
             dir,
+            db,
             limits,
             app,
             owner,
         } = self;
         drop(app);
-        let app = server::build_app(Self::config(&dir, limits)).await.unwrap();
+        let app = server::build_app(Self::config(&dir, &db, limits))
+            .await
+            .unwrap();
         Self {
             dir,
+            db,
             limits,
             app,
             owner,
@@ -133,9 +144,10 @@ impl TestServer {
         response.json()
     }
 
-    fn config(dir: &TempDir, limits: Limits) -> server::Config {
+    fn config(dir: &TempDir, db: &TestDatabase, limits: Limits) -> server::Config {
         server::Config {
-            database_path: dir.path().join("test.db"),
+            database_url: db.url.as_str().into(),
+            database_max_connections: 5,
             storage: server::StorageConfig::Local {
                 dir: dir.path().join("recordings"),
             },
@@ -302,28 +314,9 @@ impl TestServer {
         assert_eq!(self.stored_file_count(), before_files);
     }
 
-    /// 테스트 DB에 직접 연결한다. API로 아직 만들 수 없는 상태를 준비할 때 쓴다.
-    async fn db(&self) -> sqlx::SqlitePool {
-        sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(self.dir.path().join("test.db")),
-        )
-        .await
-        .unwrap()
-    }
-
     /// 송출 중인(종료 시각이 없는) 방송을 DB에 직접 넣는다.
     async fn insert_live_broadcast(&self, title: &str) -> uuid::Uuid {
-        let id = uuid::Uuid::now_v7();
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-        sqlx::query("INSERT INTO broadcasts (id, title, owner_id, created_at) VALUES (?, ?, ?, ?)")
-            .bind(id.to_string())
-            .bind(title)
-            .bind(self.owner.user.id.to_string())
-            .bind(now)
-            .execute(&self.db().await)
-            .await
-            .unwrap();
-        id
+        common::insert_broadcast(&self.db, self.owner.user.id, title, false).await
     }
 
     async fn list_by_status(&self, status: BroadcastStatus) -> Vec<Broadcast> {
@@ -671,10 +664,11 @@ fn fake_web_dist(dir: &TempDir) -> std::path::PathBuf {
 #[tokio::test]
 async fn 배포_시_서버가_웹_화면도_서빙하고_모르는_경로는_진입_html로_답한다() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = TestServer::config(&dir, Limits::default());
+    let db = TestDatabase::create().await;
+    let mut config = TestServer::config(&dir, &db, Limits::default());
     config.web_dist_dir = Some(fake_web_dist(&dir));
     let app = server::build_app(config).await.unwrap();
-    let server = TestServer::with_app(dir, Limits::default(), app).await;
+    let server = TestServer::with_app(dir, db, Limits::default(), app).await;
     let created = server.register("공유할 방송", &sample_video(10)).await;
 
     for path in [
@@ -708,7 +702,8 @@ async fn 배포_시_서버가_웹_화면도_서빙하고_모르는_경로는_진
 #[tokio::test]
 async fn 웹_정적_파일_디렉터리에_index_html이_없으면_시작하지_않는다() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = TestServer::config(&dir, Limits::default());
+    let db = TestDatabase::create().await;
+    let mut config = TestServer::config(&dir, &db, Limits::default());
     config.web_dist_dir = Some(dir.path().join("empty"));
 
     let error = server::build_app(config).await.err().unwrap();
@@ -775,70 +770,6 @@ async fn 잘못된_상태로_방송_목록을_요청하면_400이다() {
         response.error_message(),
         "방송 상태는 live 또는 ended만 쓸 수 있습니다."
     );
-}
-
-#[tokio::test]
-async fn 로그인_도입_전의_방송은_마이그레이션_후_녹화본과_함께_지워진다() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.db");
-    let recordings = dir.path().join("recordings");
-
-    // 과제 2 시점의 스키마(마이그레이션 0001~0003)에 소유자 없는 방송과 녹화본을 남긴다.
-    let mut migrator = sqlx::migrate::Migrator::new(std::path::Path::new("migrations"))
-        .await
-        .unwrap();
-    migrator.migrations = migrator
-        .migrations
-        .iter()
-        .filter(|m| m.version <= 3)
-        .cloned()
-        .collect::<Vec<_>>()
-        .into();
-    let pool = sqlx::SqlitePool::connect_with(
-        sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&db_path)
-            .create_if_missing(true),
-    )
-    .await
-    .unwrap();
-    migrator.run(&pool).await.unwrap();
-    let id = uuid::Uuid::now_v7();
-    let object_key = format!("{id}.mp4");
-    let created_at = "2026-11-01T09:00:00.000000Z";
-    sqlx::query("INSERT INTO broadcasts (id, title, created_at, ended_at) VALUES (?, ?, ?, ?)")
-        .bind(id.to_string())
-        .bind("과제 2 방송")
-        .bind(created_at)
-        .bind(created_at)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO recordings (broadcast_id, storage_backend, object_key, content_type, size_bytes) \
-         VALUES (?, 'local', ?, 'video/mp4', 1000)",
-    )
-    .bind(id.to_string())
-    .bind(&object_key)
-    .execute(&pool)
-    .await
-    .unwrap();
-    pool.close().await;
-    std::fs::create_dir_all(&recordings).unwrap();
-    std::fs::write(recordings.join(&object_key), sample_video(1000)).unwrap();
-
-    let app = server::build_app(TestServer::config(&dir, Limits::default()))
-        .await
-        .unwrap();
-    let server = TestServer::with_app(dir, Limits::default(), app).await;
-
-    assert_eq!(server.list_broadcasts().await, vec![]);
-    assert_eq!(
-        server.get(&format!("/api/broadcasts/{id}")).await.status,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(server.stored_file_count(), 0);
-    let policy: UploadPolicy = server.get(UPLOAD_POLICY_PATH).await.json();
-    assert_eq!(policy.remaining_bytes, server.limits.storage_quota_bytes);
 }
 
 #[tokio::test]
