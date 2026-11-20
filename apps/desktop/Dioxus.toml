@@ -1,11 +1,12 @@
-# `dx bundle -p desktop --release`가 읽는 설정. Windows는 .msi·설치 .exe, macOS는 .app·.dmg를 만든다.
+# `dx bundle -p chzzk-desktop --release`가 읽는 설정. Windows는 .msi·설치 .exe, macOS는 .app·.dmg를 만든다.
+# Windows MSI는 코드 페이지 1252라 한글을 넣으면 light.exe가 실패한다. 아래 값은 ASCII로 둔다.
 [application]
 name = "chzzk-desktop"
 
 [bundle]
 identifier = "work.mins.chzzk"
 publisher = "clone-chzzk"
-short_description = "치지직 클론 방송 시청 앱"
-long_description = "배포된 clone-chzzk 서버의 방송 목록을 보고 라이브·녹화 방송을 재생한다."
+short_description = "clone-chzzk broadcast viewer"
+long_description = "Lists broadcasts on the deployed clone-chzzk server and plays live (HLS) and recorded broadcasts."
 category = "Video"
 copyright = "clone-chzzk"

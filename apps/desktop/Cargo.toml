@@ -3,7 +3,7 @@ name = "chzzk-desktop"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true
-description = "치지직 클론 데스크톱 시청 클라이언트 (Windows·macOS)"
+description = "clone-chzzk desktop viewer (Windows, macOS)"
 
 [dependencies]
 shared.workspace = true
