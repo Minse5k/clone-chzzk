@@ -31,7 +31,7 @@ const PLATFORMS: &[Platform] = &[
             Package {
                 label: "설치 프로그램 (.exe)",
                 file: "chzzk-desktop-windows-x64-setup.exe",
-                note: "권장. WebView2가 없으면 설치 중에 함께 설치한다.",
+                note: "권장. WebView2가 없으면 설치 중에 내려받아 설치한다(인터넷 필요).",
             },
             Package {
                 label: "MSI 설치 파일 (.msi)",
