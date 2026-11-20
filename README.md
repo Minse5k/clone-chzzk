@@ -178,7 +178,8 @@ cp .env.example .env
 # .env에서 아래 두 값을 채운다(필수, 커밋 금지). 나머지는 비워 두면 기본값이다.
 #   POSTGRES_PASSWORD=$(openssl rand -hex 24) 결과
 #   JWT_SECRET=$(openssl rand -base64 48) 결과
-docker compose up -d --build
+# 오토스케일러는 autoscale 프로필에 있어 프로필을 켜야 뜬다(배포에서는 띄우지 않는다).
+docker compose --profile autoscale up -d --build
 ```
 
 - 첫 빌드는 웹(Dioxus)·서버를 컴파일하느라 10분 이상 걸린다.

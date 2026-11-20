@@ -1,0 +1,15 @@
+[package]
+name = "chzzk-desktop"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+description = "치지직 클론 데스크톱 시청 클라이언트 (Windows·macOS)"
+
+[dependencies]
+shared.workspace = true
+serde.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+dioxus = { version = "0.7", features = ["desktop"] }
+tokio = { version = "1", features = ["rt", "time"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }

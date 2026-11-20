@@ -1,0 +1,115 @@
+# 데스크톱 클라이언트(apps/desktop)를 Windows·macOS 패키지로 만든다.
+#
+# - PR·main 푸시: 테스트하고 패키지를 만들어 워크플로 아티팩트로 올린다(빌드 확인).
+# - `desktop-v*` 태그 푸시: 같은 패키지를 GitHub Release에 올린다. 다운로드 페이지(/download)는
+#   `releases/latest/download/<파일 이름>`으로 링크하므로 파일 이름을 고정한다.
+#
+# 공개 저장소의 GitHub 호스팅 러너는 무료다.
+name: desktop
+
+on:
+  push:
+    branches: [main]
+    tags: ["desktop-v*"]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+    paths:
+      - "apps/desktop/**"
+      - "crates/shared/**"
+      - "Cargo.lock"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DIOXUS_CLI_VERSION: "0.7.10"
+  # 패키지에 넣을 기본 서버 주소. 앱 안에서 바꿀 수 있고, 실행 환경의 CHZZK_SERVER_URL이 우선한다.
+  CHZZK_SERVER_URL: https://mins.work
+
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+            package_types: --package-types msi --package-types nsis
+          - os: macos-latest
+            name: macos-arm64
+            package_types: --package-types macos --package-types dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.name }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binstall
+      - name: Dioxus CLI 설치
+        run: cargo binstall dioxus-cli@${{ env.DIOXUS_CLI_VERSION }} --no-confirm
+
+      - name: 단위 테스트
+        run: cargo test -p chzzk-desktop --locked
+
+      - name: 패키지 만들기
+        run: dx bundle -p chzzk-desktop --desktop --release ${{ matrix.package_types }} --out-dir dist
+
+      - name: 파일 이름 고정
+        shell: bash
+        run: |
+          mkdir -p out
+          find dist -maxdepth 3 | sort
+          case "${{ matrix.name }}" in
+            windows-x64)
+              cp "$(find dist -name '*.msi' | head -1)" out/chzzk-desktop-windows-x64.msi
+              cp "$(find dist -name '*setup*.exe' | head -1)" out/chzzk-desktop-windows-x64-setup.exe
+              ;;
+            macos-arm64)
+              cp "$(find dist -name '*.dmg' | head -1)" out/chzzk-desktop-macos-arm64.dmg
+              app="$(find dist -name '*.app' -maxdepth 3 | head -1)"
+              ditto -c -k --keepParent "$app" out/chzzk-desktop-macos-arm64.app.zip
+              ;;
+          esac
+          ls -la out
+
+      # 창 없이 실행해 실행 파일이 이 OS에서 뜨고 배포 서버의 목록을 받는지 확인한다.
+      # 릴리스(태그)에서는 실패하면 멈추고, 그 밖에는 결과만 남긴다(서버가 아직 없을 수 있다).
+      - name: 실행 확인 (--check)
+        shell: bash
+        continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          case "${{ matrix.name }}" in
+            windows-x64) bin="$(find dist target -name 'chzzk-desktop.exe' -path '*release*' | head -1)" ;;
+            macos-arm64) bin="$(find dist -path '*.app/Contents/MacOS/*' -type f | head -1)" ;;
+          esac
+          echo "실행 파일: $bin"
+          "$bin" --check "$CHZZK_SERVER_URL"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chzzk-desktop-${{ matrix.name }}
+          path: out/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    needs: bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          make_latest: true
+          body: |
+            치지직 클론 데스크톱 클라이언트. 설치·실행 방법은 https://mins.work/download 를 보세요.
+            서명하지 않은 앱이라 첫 실행 때 Windows SmartScreen·macOS Gatekeeper 경고가 뜹니다.

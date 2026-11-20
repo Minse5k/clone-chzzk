@@ -3,8 +3,8 @@
 clone-chzzk를 Oracle Cloud(OCI)에 **Always Free 한도 안에서** 배포하는 순서다. 콘솔에서 직접 자원을 만들고, VM에서 Docker Compose로 앱을 띄운다.
 
 - 리전: **Japan Central (Osaka, `ap-osaka-1`)** — 홈 리전. Always Free 자원은 홈 리전에서만 무료다.
-- 구성: A1 VM 1대(Docker Compose: PostgreSQL + Redis + 앱 인스턴스들 + Caddy + 오토스케일러) + 비공개 Object Storage 버킷(녹화본)
-- 접속: `https://<공인IP를 대시로>.sslip.io`. 휴대폰 브라우저는 HTTPS에서만 카메라·마이크를 허용하므로, 도메인 없이 sslip.io 주소에 Caddy가 Let's Encrypt 인증서를 자동으로 붙인다(무료).
+- 구성: A1 VM 1대(Docker Compose: PostgreSQL + Redis + 앱 1개 + Caddy, 오토스케일러는 띄우지 않음) + 비공개 Object Storage 버킷(녹화본)
+- 접속: `https://mins.work`(과제 6에서 산 도메인, [도메인 연결](#도메인-연결-과제-6)). 휴대폰 브라우저는 HTTPS에서만 카메라·마이크를 허용하므로 Caddy가 Let's Encrypt 인증서를 자동으로 붙인다(무료). 도메인이 없으면 `https://<공인IP를 대시로>.sslip.io`를 쓴다.
 
 > ⚠️ **과금 위험 — 먼저 읽기**
 >
@@ -21,7 +21,7 @@ clone-chzzk를 Oracle Cloud(OCI)에 **Always Free 한도 안에서** 배포하�
 >
 > 다른 VM·볼륨·버킷이 이미 있다면 그 사용량도 합산된다.
 >
-> 과제 5부터 `compose.yaml`은 앱을 여러 인스턴스로 띄우는 오토스케일 구성이다. 인스턴스가 늘어도 같은 VM 안에서 CPU를 나눠 쓸 뿐 OCI 자원이 새로 생기지는 않는다(과금 없음). 2 OCPU VM에서는 `.env`에 `AUTOSCALER_MAX=2`를 두어 인스턴스를 2개까지만 띄운다.
+> 배포에서는 오토스케일러를 띄우지 않는다. `compose.yaml`의 `autoscaler`는 `autoscale` 프로필에 있어서 `docker compose up`으로는 뜨지 않고, 앱은 1개로 고정된다. 오토스케일러는 원래도 같은 VM 안의 컨테이너 수만 바꾸고 OCI 자원을 만들지 않지만, VM 자원 사용을 예측 가능하게 두려고 뺐다.
 
 ## 0. 예산 알림 만들기 (권장, 무료)
 
@@ -130,30 +130,28 @@ nano .env
 `.env`에서 다음 값을 채운다(나머지는 기본값 그대로 둔다).
 
 ```dotenv
-STORAGE_BACKEND=oci
-OCI_S3_ENDPOINT=https://<namespace>.compat.objectstorage.ap-osaka-1.oraclecloud.com
-OCI_REGION=ap-osaka-1
-OCI_BUCKET=chzzk-recordings
-OCI_ACCESS_KEY_ID=<Access Key>
-OCI_SECRET_ACCESS_KEY=<Secret Key>
-# 휴대폰 송출용 HTTPS 주소. 공인 IP의 점(.)을 대시(-)로 바꾼다. 예: 공인 IP 158.101.1.2 → 158-101-1-2.sslip.io
-SITE_ADDRESS=<공인IP를 대시로>.sslip.io
+# 서비스 주소(과제 6 도메인). Caddy가 이 이름으로 Let's Encrypt 인증서를 받는다.
+SITE_ADDRESS=mins.work
+# 데스크톱 클라이언트의 웹뷰 출처. Windows(WebView2)가 hls.js로 라이브를 받을 때 필요하다.
+CORS_ALLOWED_ORIGINS=http://dioxus.index.html,dioxus://index.html
+# 녹화본은 VM 디스크(app-data 볼륨)에 둔다. 버킷·액세스 키가 필요 없고 과금될 자원이 없다.
+STORAGE_BACKEND=local
 # 로그인 토큰 서명 키(필수). 아래 명령으로 만든 값을 넣는다(저장소에 커밋하지 않는다).
 JWT_SECRET=<openssl rand -base64 48 결과>
 # PostgreSQL 비밀번호(필수). openssl rand -hex 24 로 만든 값을 넣는다.
 POSTGRES_PASSWORD=<openssl rand -hex 24 결과>
-# 2 OCPU VM에서는 앱 인스턴스를 2개까지만 띄운다.
-AUTOSCALER_MAX=2
 # 후원 결제: 토스페이먼츠 결제위젯 테스트 키(test_로 시작). 라이브 키는 넣지 않는다.
 TOSS_CLIENT_KEY=<테스트 클라이언트 키>
 TOSS_SECRET_KEY=<테스트 시크릿 키>
 ```
 
+> 녹화본을 OCI Object Storage(무료 20GB)에 두려면 3·4단계로 버킷과 키를 만들고 `STORAGE_BACKEND=oci`, `OCI_S3_ENDPOINT`, `OCI_REGION`, `OCI_BUCKET`, `OCI_ACCESS_KEY_ID`, `OCI_SECRET_ACCESS_KEY`를 더 넣는다. 과제 6 배포는 비용 위험을 줄이려고 VM 디스크(`local`)를 쓴다. 녹화본 총량은 기본값 15GiB(`STORAGE_QUOTA_BYTES`)에서 막혀 50GB 부트 볼륨을 넘지 않는다.
+
 > `JWT_SECRET`은 VM에서 `openssl rand -base64 48`로 만든다. 여러 인스턴스가 같은 키를 써야 하므로 compose는 이 값이 비어 있으면 시작하지 않는다. `POSTGRES_PASSWORD`도 마찬가지다.
 
-> sslip.io는 `158-101-1-2.sslip.io` 같은 이름을 그 IP로 돌려주는 무료 DNS다. 가입이나 설정이 없다. Caddy는 이 이름으로 Let's Encrypt 인증서를 받으므로 80·443 포트가 열려 있어야 한다(1·5단계).
+> `SITE_ADDRESS`의 이름이 VM 공인 IP를 가리켜야 Caddy가 Let's Encrypt 인증서를 받는다(아래 [도메인 연결](#도메인-연결-과제-6)). 80·443 포트가 열려 있어야 한다(1·5단계). 도메인이 없으면 `<공인IP를 대시로>.sslip.io`(무료 DNS, 가입 없음)를 쓸 수 있다.
 
-> `DATABASE_URL`, `REDIS_URL`, `STORAGE_DIR`, `SERVER_ADDR`, `WEB_DIST_DIR`는 `compose.yaml`이 컨테이너 안의 값으로 고정하므로 `.env`의 값은 쓰이지 않는다. `API_BASE_URL`, `CORS_ALLOWED_ORIGINS`도 같은 출처로 서빙되는 배포에서는 쓰이지 않는다.
+> `DATABASE_URL`, `REDIS_URL`, `STORAGE_DIR`, `SERVER_ADDR`, `WEB_DIST_DIR`는 `compose.yaml`이 컨테이너 안의 값으로 고정하므로 `.env`의 값은 쓰이지 않는다. `API_BASE_URL`은 웹이 같은 출처로 서빙되는 배포에서는 쓰이지 않는다. `CORS_ALLOWED_ORIGINS`는 웹에는 필요 없고 데스크톱 클라이언트(다른 출처의 웹뷰) 때문에 둔다.
 
 빌드하고 실행한다. 첫 빌드는 Dioxus CLI와 의존성을 컴파일하느라 20분 이상 걸릴 수 있다.
 
@@ -166,7 +164,7 @@ docker compose logs -f app
 
 ## 7. 직접 확인
 
-브라우저에서 `https://<공인IP를 대시로>.sslip.io`를 연다. 주소창에 자물쇠가 보이면 인증서가 붙은 것이다. 처음 접속할 때 인증서 발급으로 몇 초 걸릴 수 있다(`docker compose logs caddy`에서 `certificate obtained successfully` 확인).
+브라우저에서 `https://mins.work`(또는 `SITE_ADDRESS`에 둔 주소)를 연다. `https://mins.work/healthz`가 `{"instance":…,"shutting_down":false}`로 답하면 서버가 떠 있다. 주소창에 자물쇠가 보이면 인증서가 붙은 것이다. 처음 접속할 때 인증서 발급으로 몇 초 걸릴 수 있다(`docker compose logs caddy`에서 `certificate obtained successfully` 확인).
 
 먼저 오른쪽 위 **회원가입**으로 가입한다. 방송 등록과 라이브 송출에는 로그인이 필요하다(시청은 로그인 없이 된다).
 
@@ -180,7 +178,7 @@ docker compose logs -f app
 
 휴대폰 라이브 송출(과제 2)
 
-1. 휴대폰 브라우저(안드로이드 Chrome, iOS Safari)로 같은 `https://…sslip.io` 주소를 열고 로그인한 뒤 **라이브 송출**을 누른다.
+1. 휴대폰 브라우저(안드로이드 Chrome, iOS Safari)로 같은 `https://mins.work` 주소를 열고 로그인한 뒤 **라이브 송출**을 누른다.
 2. **카메라·마이크 켜기** → 권한을 허용하면 미리보기가 나온다. 제목을 넣고 **방송 시작**.
 3. PC 브라우저에서 방송 목록을 열면 **라이브 중**에 방송이 보인다. 눌러서 3~6초 지연으로 시청한다.
 4. 휴대폰에서 **방송 종료** → PC 화면이 `종료`로 바뀌고, 잠시 뒤 녹화본으로 다시 볼 수 있다.
@@ -189,12 +187,12 @@ docker compose logs -f app
 도네이션(과제 4)
 
 1. A가 휴대폰으로 송출하는 동안 B가 PC에서 그 방송 상세의 **후원하기**로 테스트 결제를 마친다 → 성공 화면과 A·B 화면의 후원 내역·합계가 바뀐다.
-2. 토스페이먼츠 [개발자센터 > 웹훅](https://developers.tosspayments.com/my/webhook)에 `https://<공인IP를 대시로>.sslip.io/api/payments/toss/webhook`을 `PAYMENT_STATUS_CHANGED`로 등록한다(가입해 받은 테스트 키일 때). 결제 후 웹훅 기록의 **다시 시도**로 같은 통지를 보내도 합계가 늘지 않는다.
+2. 토스페이먼츠 [개발자센터 > 웹훅](https://developers.tosspayments.com/my/webhook)에 `https://mins.work/api/payments/toss/webhook`을 `PAYMENT_STATUS_CHANGED`로 등록한다(가입해 받은 테스트 키일 때). 결제 후 웹훅 기록의 **다시 시도**로 같은 통지를 보내도 합계가 늘지 않는다.
 3. 나머지는 README의 [직접 확인 절차 > 과제 4](../README.md#과제-4-도네이션-테스트-결제-성공실패취소-승인-통지-중복)를 따르고 `API=`만 이 주소로 바꾼다.
 
 인증·인가와 댓글(과제 3)
 
-README의 [직접 확인 절차 > 과제 3](../README.md#과제-3-비로그인방송-소유자다른-사용자별-허용과-거절)을 그대로 따른다. API 확인 명령의 `API=`만 `https://<공인IP를 대시로>.sslip.io`로 바꾼다.
+README의 [직접 확인 절차 > 과제 3](../README.md#과제-3-비로그인방송-소유자다른-사용자별-허용과-거절)을 그대로 따른다. API 확인 명령의 `API=`만 `https://mins.work`로 바꾼다.
 
 1. 사용자 둘(A, B)로 가입한다. A가 등록·송출한 방송의 상세에는 A에게만 **방송 관리**가 보인다.
 2. B로 같은 방송의 제목 수정·삭제·라이브 종료 API를 보내면 403, 비로그인이면 401이다.
@@ -223,17 +221,16 @@ PostgreSQL 백업은 다음처럼 한다.
 docker compose exec postgres pg_dump -U chzzk chzzk > chzzk-backup.sql
 ```
 
-## 자기 도메인 쓰기 (선택)
+## 도메인 연결 (과제 6)
 
-sslip.io 대신 자기 도메인을 쓰려면 도메인의 A 레코드를 VM 공인 IP로 맞춘 뒤, `.env`의 `SITE_ADDRESS`를 바꾸고 다시 띄운다. Caddy가 새 인증서를 자동으로 발급한다.
+도메인 `mins.work`는 Cloudflare Registrar에서 샀고, DNS도 Cloudflare가 맡는다.
 
-```dotenv
-SITE_ADDRESS=example.com
-```
-
-```bash
-docker compose up -d
-```
+1. Cloudflare 대시보드 → `mins.work` → **DNS → Records → Add record**
+2. Type `A`, Name `@`, IPv4 address에 VM 공인 IP, **Proxy status는 끈다(DNS only, 회색 구름)**, TTL Auto → Save
+   - 프록시를 켜면 Cloudflare가 TLS를 끝내 Caddy가 인증서를 받지 못하고, 무료 프록시의 업로드 크기 제한(100MB)에 녹화본 업로드가 걸린다.
+3. 전파 확인: `dig +short mins.work`가 VM 공인 IP를 돌려주면 된다(보통 몇 분).
+4. VM의 `.env`에 `SITE_ADDRESS=mins.work`를 두고 `docker compose up -d`. Caddy가 HTTP-01 챌린지(80번)로 Let's Encrypt 인증서를 받아 443에 붙이고, 80은 443으로 돌린다. 인증서는 만료 전에 Caddy가 자동 갱신한다(`caddy-data` 볼륨에 저장).
+5. 확인: `curl -sI https://mins.work/healthz`가 `HTTP/2 200`, `curl -sI http://mins.work`가 `308`(HTTPS로 이동).
 
 ## 정리(과금 중단)
 

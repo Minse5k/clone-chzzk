@@ -1,0 +1,11 @@
+# `dx bundle -p desktop --release`가 읽는 설정. Windows는 .msi·설치 .exe, macOS는 .app·.dmg를 만든다.
+[application]
+name = "chzzk-desktop"
+
+[bundle]
+identifier = "work.mins.chzzk"
+publisher = "clone-chzzk"
+short_description = "치지직 클론 방송 시청 앱"
+long_description = "배포된 clone-chzzk 서버의 방송 목록을 보고 라이브·녹화 방송을 재생한다."
+category = "Video"
+copyright = "clone-chzzk"
