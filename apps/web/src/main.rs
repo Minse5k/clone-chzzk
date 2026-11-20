@@ -3,11 +3,13 @@
 mod api;
 mod comments;
 mod donations;
+mod download;
 mod live;
 mod session;
 
 use chrono::{DateTime, Local, Utc};
 use dioxus::prelude::*;
+use download::DownloadPage;
 use futures_util::StreamExt;
 use gloo_timers::future::TimeoutFuture;
 use live::{Facing, LiveEvent, LiveSession};
@@ -43,6 +45,8 @@ enum Route {
     DonationSuccess { query: String },
     #[route("/donations/fail?:..query")]
     DonationFail { query: String },
+    #[route("/download")]
+    DownloadPage {},
     #[route("/:..segments")]
     PageNotFound { segments: Vec<String> },
 }
@@ -78,6 +82,7 @@ fn Shell() -> Element {
             nav { class: "actions",
                 Link { class: "button live", to: Route::LiveBroadcast {}, "라이브 송출" }
                 Link { class: "button", to: Route::BroadcastRegistration {}, "방송 등록" }
+                Link { class: "button secondary", to: Route::DownloadPage {}, "앱 다운로드" }
                 AccountMenu {}
             }
         }

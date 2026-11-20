@@ -3,7 +3,8 @@
 #   caddy ──(분산)──> app × N ──> postgres (DB)
 #                       │   └──> redis (인스턴스 간 알림)
 #                       └──> app-data 볼륨 (녹화본·라이브 HLS 조각, 모든 인스턴스가 공유)
-#   autoscaler: app의 CPU 사용률을 보고 N을 AUTOSCALER_MIN~MAX 사이로 바꾼다.
+#   autoscaler(autoscale 프로필): app의 CPU 사용률을 보고 N을 AUTOSCALER_MIN~MAX 사이로 바꾼다.
+#     평소(배포 포함)에는 뜨지 않는다. 과제 5 시연용: `docker compose --profile autoscale up -d`
 #   k6(load 프로필): 부하 발생기. `docker compose --profile load run --rm k6`
 #
 # 비밀 값은 저장소에 없는 .env 파일로만 넣는다(.env.example 참고).
@@ -87,7 +88,9 @@ services:
       - caddy-config:/config
 
   # 직접 만든 오토스케일러(apps/autoscaler). Docker 소켓으로 app 컨테이너를 재고 늘리고 줄인다.
+  # 배포에서는 쓰지 않는다(인스턴스 수를 고정해 VM 자원을 예측 가능하게 둔다).
   autoscaler:
+    profiles: ["autoscale"]
     build:
       context: .
       dockerfile: apps/autoscaler/Dockerfile
