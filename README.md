@@ -95,7 +95,16 @@ dx bundle -p chzzk-desktop --desktop --release --package-types msi --package-typ
 
 ### OS·아키텍처별 테스트 결과
 
-TEST_RESULTS_PLACEHOLDER
+2026-11-23, 릴리스 [`desktop-v0.1.0`](https://github.com/Minse5k/clone-chzzk/releases/tag/desktop-v0.1.0), 서버 https://mins.work 에 녹화 방송 1개(「테스트 방송 (데스크톱 재생 확인용)」, 15초 mp4)를 올려 두고 확인했다.
+
+| OS · 아키텍처 | 받은 파일(공개 링크) | 설치·실행 | 방송 목록 | 재생 | 확인 방법 |
+|---|---|---|---|---|---|
+| macOS 27.2.1 · Apple Silicon(arm64) | `chzzk-desktop-macos-arm64.dmg` | ✅ dmg 마운트 → 앱 복사 → 격리 속성 제거 후 실행 | ✅ 1개 표시 | ✅ 녹화본 끝까지 재생 | 실제 기기(창 실행 + `--check`) |
+| Windows Server(GitHub Actions `windows-latest`) · x64 | 빌드 산출물 `chzzk-desktop.exe` | ✅ 실행됨(창 없이) | ✅ `서버 https://mins.work: 방송 1개` | ➖ 창 재생은 확인 못 함 | CI의 `--check` 단계([릴리스 빌드 로그](https://github.com/Minse5k/clone-chzzk/actions/runs/45088760949)) |
+| Windows 10/11 데스크톱 · x64 | `chzzk-desktop-windows-x64-setup.exe` | ⬜ 미확인 | ⬜ 미확인 | ⬜ 미확인 | 테스트할 Windows 기기가 없어 아직 못 함 |
+
+- 공개 다운로드 링크 4개(`.exe`, `.msi`, `.dmg`, `.app.zip`)는 모두 `releases/latest/download/<파일>`에서 200으로 내려받아지는 것을 확인했다.
+- Windows 실기기 확인은 기기를 구하면 위 [설치·실행 확인 절차](#설치실행-확인-절차)대로 하고 이 표를 고친다.
 
 ## 과제 5 구현 범위(유지)
 
