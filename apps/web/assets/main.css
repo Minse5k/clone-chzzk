@@ -333,3 +333,22 @@ button.link {
 @keyframes donation-flash {
     from { background: color-mix(in srgb, var(--live) 45%, transparent); }
 }
+
+.download-platform {
+    margin-top: 24px;
+    padding: 16px 20px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+}
+.download-platform h2 { margin: 0 0 4px; }
+.download-arch { margin: 0; font-weight: 700; color: var(--accent); }
+.download-files { list-style: none; margin: 12px 0; padding: 0; display: grid; gap: 8px; }
+.download-steps li { margin: 4px 0; }
+.download-code {
+    padding: 10px 12px;
+    border-radius: 6px;
+    background: var(--bg);
+    overflow-x: auto;
+    white-space: pre;
+}

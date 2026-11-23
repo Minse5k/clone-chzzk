@@ -5,7 +5,108 @@
 - 도메인 용어: [GLOSSARY.md](GLOSSARY.md)
 - 설계 결정: [docs/adr/](docs/adr/) (라이브 송출 방식은 [ADR 0003](docs/adr/0003-live-ingest-websocket-to-hls.md), 로그인 방식은 [ADR 0004](docs/adr/0004-jwt-auth-with-revocation-list.md), 후원 결제 확정 방식은 [ADR 0005](docs/adr/0005-donation-confirmed-by-server-payment-approval.md), 여러 인스턴스의 공용 상태와 오토스케일 방식은 [ADR 0006](docs/adr/0006-multi-instance-shared-state.md))
 
-## 이번 단계(과제 5) 구현 범위
+## 이번 단계(과제 6) 구현 범위
+
+과제 5까지의 서비스를 **산 도메인으로 OCI Always Free VM에 HTTPS로 배포**하고, 배포된 서버의 방송을 보는 **Windows·macOS 데스크톱 클라이언트**와 **다운로드 페이지**를 더했다.
+
+- 서비스: **https://mins.work**
+- 다운로드 페이지: **https://mins.work/download**
+- 상태 확인: https://mins.work/healthz
+
+| 요구 사항 | 구현 |
+|---|---|
+| 도메인 | `mins.work`, Cloudflare Registrar. 등록·DNS·TLS는 [도메인과 HTTPS](#도메인과-https)에 적었다. |
+| OCI 배포 | 오사카 리전 A1.Flex 2 OCPU/12GB VM 1대에서 Docker Compose(PostgreSQL·Redis·app 1개·Caddy)로 띄운다. 절차는 [docs/deploy-oci.md](docs/deploy-oci.md), 사양과 무료 근거는 [OCI VM](#oci-vm)에 있다. |
+| 기존 기능 유지 + 헬스 체크 | 과제 1~5의 서버·웹을 그대로 배포한다. `GET /healthz`가 인스턴스 상태를 JSON으로 답한다(내려가는 중이면 503). |
+| 비밀 값·서비스 주소 | 모두 VM의 `.env`(저장소에 없음, `chmod 600`)로 넣는다: `SITE_ADDRESS`(도메인), `JWT_SECRET`, `POSTGRES_PASSWORD`, 토스 테스트 키, `CORS_ALLOWED_ORIGINS`. 예시는 [.env.example](.env.example). 데스크톱 앱의 서버 주소는 빌드 때 `CHZZK_SERVER_URL`(기본 `https://mins.work`)로 정하고, 실행 환경의 `CHZZK_SERVER_URL`이나 앱 위쪽 서버 칸으로 바꿀 수 있다. |
+| 데스크톱 클라이언트 | [`apps/desktop`](apps/desktop/src/main.rs)(Dioxus 데스크톱, Windows는 WebView2·macOS는 WKWebView). 배포 서버의 방송 목록(전체·라이브·종료)을 받고, 고른 방송을 앱 안에서 재생한다. 라이브는 HLS(macOS는 웹뷰가 바로, Windows는 hls.js), 종료된 방송은 녹화본(Range 요청)이다. 재생 방식 판단은 [`api.rs`](apps/desktop/src/api.rs)(단위 테스트 6개). `--check` 옵션은 창 없이 목록과 재생 주소를 출력해 설치 확인과 CI에 쓴다. |
+| Windows·macOS 패키지 | [`.github/workflows/desktop.yml`](.github/workflows/desktop.yml)이 `dx bundle`로 Windows x64(`.exe` 설치 프로그램, `.msi`)와 macOS arm64(`.dmg`, `.app.zip`)를 만든다. `desktop-v*` 태그를 올리면 GitHub Release에 고정된 파일 이름으로 올라간다. |
+| 다운로드 페이지 | 웹의 [`/download`](apps/web/src/download.rs). OS별 파일 링크(`releases/latest/download/<파일>`), 지원 아키텍처, 설치·실행 절차, 서명하지 않은 앱 경고 넘기는 법. |
+
+### 도메인과 HTTPS
+
+| 항목 | 값 |
+|---|---|
+| 도메인 | `mins.work` |
+| 등록 기관 | Cloudflare Registrar |
+| 등록일 / 만료일 | 2026-11-20 / 2027-11-20 (1년) |
+| 최초 등록 비용 | **US$10.20** (1년) |
+| 갱신 비용 | **US$10.20 / 년** (Cloudflare는 레지스트리 원가에 팔아 첫해와 갱신 가격이 같다) |
+| DNS | Cloudflare DNS. `A @ → VM 공인 IP`, **Proxy 끔(DNS only)** |
+| TLS | VM의 Caddy가 Let's Encrypt에서 자동 발급·갱신(HTTP-01, 80번). HTTP는 HTTPS로 308 이동. |
+
+- 프록시(주황 구름)를 끈 이유: 켜면 Cloudflare가 TLS를 끝내 Caddy가 직접 인증서를 받지 못하고, 무료 프록시의 업로드 크기 제한(100MB)에 녹화본 업로드(최대 2GB)가 걸린다.
+- `deploy/Caddyfile`의 사이트 주소는 `{$SITE_ADDRESS::80}`이다. `.env`에 `SITE_ADDRESS=mins.work`를 두면 Caddy가 그 이름으로 인증서를 받는다.
+- 설정 절차: [docs/deploy-oci.md > 도메인 연결](docs/deploy-oci.md#도메인-연결-과제-6)
+
+### OCI VM
+
+| 항목 | 값 |
+|---|---|
+| 리전 | Japan Central (Osaka, `ap-osaka-1`), 홈 리전 |
+| Shape | `VM.Standard.A1.Flex` (Ampere, arm64) |
+| OCPU / 메모리 | **2 OCPU / 12GB** |
+| 부트 볼륨 | 50GB |
+| 이미지 | Ubuntu 24.04 (aarch64) |
+| 공인 IP | 임시(ephemeral) 공인 IP. 예약 IP는 쓰지 않는다. |
+
+Always Free에 맞는 이유:
+
+| 자원 | Always Free 한도(테넌시 합계) | 사용량 |
+|---|---|---|
+| A1 Compute | 4 OCPU, 24GB | 2 OCPU, 12GB |
+| 블록 스토리지 | 200GB | 50GB (부트 볼륨) |
+| 아웃바운드 전송 | 월 10TB | 시청 트래픽 |
+| Object Storage | 20GB | 쓰지 않음(녹화본은 VM 디스크, 총량 15GiB에서 업로드를 막음) |
+
+- 오토스케일러는 배포에서 띄우지 않는다(`compose.yaml`의 `autoscale` 프로필). app은 1개로 고정해 VM 자원 사용이 일정하다. 오토스케일러는 원래도 같은 VM 안의 컨테이너 수만 바꾸고 OCI 자원을 만들지 않는다.
+- 2 OCPU에서 라이브 재인코딩은 방송당 OCPU 1개 안팎이라 동시 라이브를 2개(`MAX_LIVE_BROADCASTS` 기본값)로 둔다.
+- 예산 알림(`free-tier-guard`, 월 US$1)을 걸어 두어 혹시 과금이 생기면 바로 메일이 온다.
+
+### 데스크톱 클라이언트 직접 빌드
+
+```bash
+cargo install dioxus-cli --version 0.7.10 --locked
+cargo test -p chzzk-desktop
+cargo run -p chzzk-desktop                                  # 창으로 실행 (기본 서버 https://mins.work)
+CHZZK_SERVER_URL=http://localhost:8088 cargo run -p chzzk-desktop   # 로컬 서버로 실행
+cargo run -p chzzk-desktop -- --check https://mins.work     # 창 없이 목록·재생 주소 확인
+dx bundle -p chzzk-desktop --desktop --release --package-types macos --package-types dmg   # macOS 패키지
+dx bundle -p chzzk-desktop --desktop --release --package-types msi --package-types nsis    # Windows 패키지 (Windows에서)
+```
+
+### 설치·실행 확인 절차
+
+다운로드 페이지(https://mins.work/download)에 같은 내용이 있다.
+
+**Windows (x64)**
+
+1. `chzzk-desktop-windows-x64-setup.exe`를 받아 실행한다. SmartScreen 경고가 뜨면 **추가 정보 → 실행**(서명하지 않은 앱).
+2. 시작 메뉴에서 **ChzzkDesktop**을 연다. 왼쪽에 https://mins.work 의 방송 목록이 뜬다.
+3. 방송을 누르면 오른쪽에서 재생된다(라이브는 음소거로 시작).
+4. 창 없이 확인: PowerShell에서 `& "$env:LOCALAPPDATA\ChzzkDesktop\chzzk-desktop.exe" --check` → `서버 https://mins.work: 방송 N개`.
+
+**macOS (Apple Silicon)**
+
+1. `chzzk-desktop-macos-arm64.dmg`를 열고 **ChzzkDesktop**을 응용 프로그램 폴더로 끈다.
+2. 서명·공증하지 않은 앱이라 `xattr -dr com.apple.quarantine /Applications/ChzzkDesktop.app` 후 연다(또는 시스템 설정 → 개인정보 보호 및 보안 → 그래도 열기).
+3. 방송 목록이 뜨고, 방송을 누르면 재생된다.
+4. 창 없이 확인: `/Applications/ChzzkDesktop.app/Contents/MacOS/chzzk-desktop --check`
+
+### OS·아키텍처별 테스트 결과
+
+2026-11-23, 릴리스 [`desktop-v0.1.0`](https://github.com/Minse5k/clone-chzzk/releases/tag/desktop-v0.1.0), 서버 https://mins.work 에 녹화 방송 1개(「테스트 방송 (데스크톱 재생 확인용)」, 15초 mp4)를 올려 두고 확인했다.
+
+| OS · 아키텍처 | 받은 파일(공개 링크) | 설치·실행 | 방송 목록 | 재생 | 확인 방법 |
+|---|---|---|---|---|---|
+| macOS 27.2.1 · Apple Silicon(arm64) | `chzzk-desktop-macos-arm64.dmg` | ✅ dmg 마운트 → 앱 복사 → 격리 속성 제거 후 실행 | ✅ 1개 표시 | ✅ 녹화본 끝까지 재생 | 실제 기기(창 실행 + `--check`) |
+| Windows Server(GitHub Actions `windows-latest`) · x64 | 빌드 산출물 `chzzk-desktop.exe` | ✅ 실행됨(창 없이) | ✅ `서버 https://mins.work: 방송 1개` | ➖ 창 재생은 확인 못 함 | CI의 `--check` 단계([릴리스 빌드 로그](https://github.com/Minse5k/clone-chzzk/actions/runs/45088760949)) |
+| Windows 10/11 데스크톱 · x64 | `chzzk-desktop-windows-x64-setup.exe` | ⬜ 미확인 | ⬜ 미확인 | ⬜ 미확인 | 테스트할 Windows 기기가 없어 아직 못 함 |
+
+- 공개 다운로드 링크 4개(`.exe`, `.msi`, `.dmg`, `.app.zip`)는 모두 `releases/latest/download/<파일>`에서 200으로 내려받아지는 것을 확인했다.
+- Windows 실기기 확인은 기기를 구하면 위 [설치·실행 확인 절차](#설치실행-확인-절차)대로 하고 이 표를 고친다.
+
+## 과제 5 구현 범위(유지)
 
 과제 4까지의 서비스를 **로컬에서 여러 인스턴스로 띄우고, CPU 사용률에 따라 인스턴스 수가 자동으로 늘고 줄게** 했다. 클라우드 배포 없이 Docker Compose 하나로 확인한다. 인스턴스가 늘거나 줄어도 로그인·영상·라이브·댓글·후원이 유지되도록 상태를 모두 인스턴스 밖 공용 저장소로 옮겼다.
 
@@ -106,9 +207,11 @@ Cargo workspace 모노레포.
 |---|---|
 | `apps/server` | axum API 서버. PostgreSQL(sqlx)에 사용자·방송·댓글·후원을 저장한다. `src/auth.rs`가 회원가입·로그인·로그아웃과 토큰 검증(`AuthUser`), `src/api.rs`가 방송 API와 소유자 권한 확인(`find_owned`), `src/comments.rs`가 댓글 API와 방송 알림 WebSocket, `src/donations.rs`가 후원 주문·승인 확인·실패 통지·웹훅·내역, `src/payments.rs`가 토스페이먼츠 결제 승인·조회 API, `src/live.rs`가 송출 WebSocket·ffmpeg HLS 변환·라이브 재생·종료 후 녹화본·하트비트, `src/bus.rs`가 Redis Pub/Sub로 인스턴스 사이의 알림 전달을 맡는다. |
 | `apps/web` | Dioxus 0.7 웹 앱. 방송 목록·상세(녹화본/라이브 플레이어, 소유자 관리, 댓글)·등록·라이브 송출·로그인·회원가입 화면. `src/session.rs`가 로그인 상태, `src/comments.rs`가 댓글 영역과 실시간 연결, `src/donations.rs`가 후원 폼·토스페이먼츠 결제위젯·결제 결과 화면·후원 내역, `src/live.rs`가 카메라·마이크와 송출을 맡는다. |
-| `apps/autoscaler` | 직접 만든 오토스케일러(과제 5). docker CLI로 app 인스턴스의 CPU 사용률을 재고 `src/policy.rs`의 규칙으로 인스턴스 수를 바꾼다. |
-| `crates/shared` | 서버와 웹이 함께 쓰는 API 타입, 송출·댓글 WebSocket 메시지. |
-| `compose.yaml`, `deploy/` | 로컬 오토스케일 구성(PostgreSQL, Redis, app × N, Caddy, 오토스케일러, k6 부하). `deploy/Caddyfile`이 분산, `deploy/load/k6.js`가 부하 스크립트. |
+| `apps/desktop` | Dioxus 데스크톱 시청 클라이언트(과제 6, Windows·macOS). `src/api.rs`가 서버 주소·방송 목록·재생 방식 판단, `src/main.rs`가 화면과 HLS 플레이어, `Dioxus.toml`이 패키지 설정. |
+| `apps/autoscaler` | 직접 만든 오토스케일러(과제 5, 배포에서는 띄우지 않음). docker CLI로 app 인스턴스의 CPU 사용률을 재고 `src/policy.rs`의 규칙으로 인스턴스 수를 바꾼다. |
+| `crates/shared` | 서버·웹·데스크톱이 함께 쓰는 API 타입, 송출·댓글 WebSocket 메시지. |
+| `.github/workflows/desktop.yml` | 데스크톱 클라이언트 Windows·macOS 패키지 빌드와 GitHub Release. |
+| `compose.yaml`, `deploy/` | 배포·로컬 구성(PostgreSQL, Redis, app, Caddy; `autoscale` 프로필의 오토스케일러, `load` 프로필의 k6 부하). `deploy/Caddyfile`이 분산, `deploy/load/k6.js`가 부하 스크립트. |
 
 ## 준비물
 
@@ -178,7 +281,8 @@ cp .env.example .env
 # .env에서 아래 두 값을 채운다(필수, 커밋 금지). 나머지는 비워 두면 기본값이다.
 #   POSTGRES_PASSWORD=$(openssl rand -hex 24) 결과
 #   JWT_SECRET=$(openssl rand -base64 48) 결과
-docker compose up -d --build
+# 오토스케일러는 autoscale 프로필에 있어 프로필을 켜야 뜬다(배포에서는 띄우지 않는다).
+docker compose --profile autoscale up -d --build
 ```
 
 - 첫 빌드는 웹(Dioxus)·서버를 컴파일하느라 10분 이상 걸린다.

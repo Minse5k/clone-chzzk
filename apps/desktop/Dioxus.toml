@@ -1,0 +1,17 @@
+# `dx bundle -p chzzk-desktop --release`가 읽는 설정. Windows는 .msi·설치 .exe, macOS는 .app·.dmg를 만든다.
+# Windows MSI는 코드 페이지 1252라 한글을 넣으면 light.exe가 실패한다. 아래 값은 ASCII로 둔다.
+[application]
+name = "chzzk-desktop"
+
+[bundle]
+identifier = "work.mins.chzzk"
+publisher = "clone-chzzk"
+short_description = "clone-chzzk broadcast viewer"
+long_description = "Lists broadcasts on the deployed clone-chzzk server and plays live (HLS) and recorded broadcasts."
+category = "Video"
+copyright = "clone-chzzk"
+
+# WebView2 오프라인 설치본(약 150MB)을 넣지 않고, 작은 부트스트래퍼만 넣어 필요할 때 받는다.
+# Windows 11과 최신 Windows 10에는 WebView2가 이미 있어 대부분 아무것도 받지 않는다.
+[bundle.windows]
+webview_install_mode = { EmbedBootstrapper = { silent = true } }
